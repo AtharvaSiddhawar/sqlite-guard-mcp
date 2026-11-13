@@ -1,0 +1,1 @@
+"""SQLite Guard MCP server."""
