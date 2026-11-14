@@ -234,16 +234,6 @@ class SQLiteGuard:
                     "max_rows": self.max_rows,
                 }
             )
-        except sqlite3.Error as exc:
-            if "interrupted" in str(exc).lower():
-                return _json_result(
-                    {"error": "Query exceeded the execution time limit."}
-                )
-            return _json_result(
-                {
-                    "error": (
-                        "Query rejected or failed; only safe read-only queries "
-                        "are allowed."
-                    )
-                }
+-        except sqlite3.Error as exc:
++        except (sqlite3.Error, sqlite3.Warning) as exc:
           )
