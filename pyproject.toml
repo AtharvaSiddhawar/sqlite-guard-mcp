@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sqlite-guard-mcp"
 version = "0.1.0"
-description = "A deterministic, zero-setup, sandboxed SQLite Model Context Protocol (MCP) server for local AI agents."
+description = "A deterministic, zero-setup, sandboxed SQLite MCP server for local AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -58,4 +58,5 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.ruff]
-line-
+line-length = 100
+target-version = "py310"
