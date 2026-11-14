@@ -1,5 +1,4 @@
-"""Read-only SQLite access for MCP clients."""
+"""sqlite-guard-mcp package."""
+from .server import SQLiteGuardMCPServer, SQLiteGuardServer, __version__, main
 
-from .server import SQLiteGuard
-
-__all__ = ["SQLiteGuard"]
+__all__ = ["SQLiteGuardMCPServer", "SQLiteGuardServer", "__version__", "main"]
