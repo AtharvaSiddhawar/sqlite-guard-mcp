@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.26.3"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqlite-guard-mcp"
