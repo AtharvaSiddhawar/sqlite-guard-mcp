@@ -1,107 +1,61 @@
-# SQLite Guard MCP
+# sqlite-guard-mcp
 
-A read-only [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
-server for exploring one local SQLite database. It gives MCP clients three tools:
+**A deterministic, zero-setup, sandboxed [Model Context Protocol (MCP)](https://modelcontextprotocol.io/specification/2026-07-28) server for local SQLite databases.**
 
-- `list_tables` — list user tables and views.
-- `describe_table` — inspect a table or view's columns.
-- `query_database` — run one read-only `SELECT` or `WITH` query.
+Most SQLite MCP servers rely on naive regular-expression checks (`^\s*(SELECT|WITH)\b`) that fail against write-capable CTEs (`WITH changed AS (DELETE FROM people RETURNING id) SELECT * FROM changed`), dump sensitive columns (`password`, `api_key`, `secret`, `token`) straight into the LLM context on `SELECT *`, or lock up on unindexed Cartesian joins because agents cannot run `PRAGMA index_list` or `EXPLAIN QUERY PLAN`.
 
-## Safety and limits
+`sqlite-guard-mcp` enforces security directly at the SQLite C-API boundary using Python's standard library [`sqlite3.Connection.set_authorizer()`](https://docs.python.org/3/library/sqlite3.html) ([SQLite Compile-Time Authorization Callbacks](https://www.sqlite.org/c3ref/set_authorizer.html)), `connection.setlimit()`, and [`sqlite3.Connection.set_progress_handler()`](https://docs.python.org/3/library/sqlite3.html)—with **zero external runtime dependencies**.
 
-- Opens the configured database in SQLite read-only URI mode.
-- Enables SQLite `query_only` and a restrictive authorizer.
-- Rejects SQL that does not begin with `SELECT` or `WITH`.
-- Blocks write actions and selected non-deterministic or sensitive functions.
-- Caps results at 200 rows and query execution at two seconds by default.
-- Applies additional SQLite limits where supported by the Python runtime.
-- Uses no network services and stores no credentials.
+## 10-Second Zero-Setup Quickstart (`uvx`)
 
-This is a local developer tool, not a security boundary against a hostile machine
-owner or a malicious SQLite extension. Use it with a database copy if the data is
-sensitive.
-
-## Requirements
-
-- Python 3.10 or newer
-- An existing SQLite database file
-
-## Install and run
-
-From the repository directory:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-SQLITE_GUARD_DB=/absolute/path/to/database.sqlite python -m sqlite_guard_mcp
-```
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .
-$env:SQLITE_GUARD_DB = "C:\path\to\database.sqlite"
-python -m sqlite_guard_mcp
-```
-
-The server uses MCP's standard input/output transport. Run it through an MCP
-client rather than as an interactive command-line application.
-
-## Claude Desktop example
-
-After installing the package in the project's virtual environment, add a server
-entry to your MCP client configuration. Replace the paths with your local paths.
-
-macOS/Linux:
+You don't need to clone this repository, create a `.venv`, or hardcode local virtualenv paths. Drop this block directly into your `claude_desktop_config.json` (see the [MCP Getting Started Guide](https://modelcontextprotocol.io/docs/2026-07-28/getting-started/intro)) to run `sqlite-guard-mcp` in 10 seconds via `uvx`:
 
 ```json
 {
   "mcpServers": {
     "sqlite-guard": {
-      "command": "/absolute/path/to/repo/.venv/bin/sqlite-guard-mcp",
-      "env": {
-        "SQLITE_GUARD_DB": "/absolute/path/to/database.sqlite"
-      }
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/AtharvaSiddhawar/sqlite-guard-mcp",
+        "sqlite-guard-mcp",
+        "--db",
+        "/absolute/path/to/your/database.sqlite"
+      ]
     }
   }
 }
 ```
 
-Windows:
+## What `sqlite-guard-mcp` Enforces at the C-API Layer
 
-```json
-{
-  "mcpServers": {
-    "sqlite-guard": {
-      "command": "C:\\absolute\\path\\to\\repo\\.venv\\Scripts\\sqlite-guard-mcp.exe",
-      "env": {
-        "SQLITE_GUARD_DB": "C:\\path\\to\\database.sqlite"
-      }
-    }
-  }
-}
-```
+| Security Layer | Mechanism in `src/sqlite_guard_mcp/server.py` | Protection Provided |
+| :--- | :--- | :--- |
+| **Read-Only Descriptor & Defensive PRAGMAs** | `mode=ro`, `PRAGMA query_only = ON`, `PRAGMA trusted_schema = OFF` | Prevents file creation, disk writes, and malicious SQL functions inside database schemas |
+| **Compile-Time Authorizer (`_authorize`)** | [`sqlite3_set_authorizer`](https://www.sqlite.org/c3ref/set_authorizer.html) | Blocks `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ATTACH`, and CTE write-smuggling (`WITH changed AS (DELETE ...)`) at statement preparation |
+| **C-API Sensitive Column Masking** | Returns [`sqlite3.SQLITE_IGNORE`](https://www.sqlite.org/c3ref/c_deny.html) on `sqlite3.SQLITE_READ` | Automatically masks `password`, `passwd`, `token`, `secret`, `api_key`, `private_key`, and `ssn` columns as `NULL` in compiled bytecode—protecting both `SELECT *` and boolean blind `WHERE password LIKE ...` probes |
+| **Index & Query-Plan Introspection** | Permits `PRAGMA table_info`, `PRAGMA index_list`, `PRAGMA index_info`, `PRAGMA foreign_key_list`, and `EXPLAIN QUERY PLAN` | Lets agents inspect indexes and verify query plans before running queries on large tables |
+| **Blocked Extension & File Functions** | Denies `load_extension`, `readfile`, `writefile`, `fts3_tokenizer`, `randomblob`, `zeroblob` | Prevents local file exfiltration, shared-library execution, and memory exhaustion |
+| **C-API Structural & VM Time Limits** | `connection.setlimit()` + `set_progress_handler()` (2.0s timeout / 250k VM steps) | Halts runaway cross joins and deeply nested expressions deterministically |
 
-## Development
+## Exposed MCP Tools
 
-Install the development dependencies and run the test suite:
+Following the [MCP Server Tools Specification](https://modelcontextprotocol.io/specification/2026-07-28/server/tools), `sqlite-guard-mcp` exposes four tools over stdio JSON-RPC 2.0:
 
-```bash
-python -m pip install -e ".[dev]"
-python -m pytest
-```
+- `read_query(sql, params?)`: Execute a parameterized `SELECT`, `WITH`, `EXPLAIN QUERY PLAN`, or allowed `PRAGMA` query with bounded row counts (`max_rows=250`) and automatic C-API `NULL` masking for sensitive columns.
+- `list_tables()`: List all user tables and views in the database.
+- `describe_table(table_name)`: Inspect columns (`PRAGMA table_info`), indexes (`PRAGMA index_list` and `PRAGMA index_info`), foreign keys (`PRAGMA foreign_key_list`), and whether each column is masked by `_authorize`.
+- `explain_query(sql, params?)`: Run `EXPLAIN QUERY PLAN` on a query to verify whether SQLite will use an index (`SEARCH ... USING INDEX`) or perform a full-table scan (`SCAN`) before hitting the 2-second execution timeout.
 
-Build the distribution locally with:
+## Local Development & Testing
 
 ```bash
-python -m build
+git clone https://github.com/AtharvaSiddhawar/sqlite-guard-mcp.git
+cd sqlite-guard-mcp
+python3 -m unittest discover -s tests -v
 ```
 
 ## License
 
-This project is distributed under the MIT License. See [LICENSE](LICENSE).
+MIT License
+
