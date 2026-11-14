@@ -35,12 +35,17 @@ class TestSQLiteGuardServer(unittest.TestCase):
                 email TEXT NOT NULL,
                 password TEXT NOT NULL,
                 api_key TEXT NOT NULL,
-                secret_token TEXT NOT NULL
+                secret_token TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL
             );
             CREATE INDEX idx_people_email ON people(email);
 
-            INSERT INTO people (id, name, email, password, api_key, secret_token)
-            VALUES (1, 'Alice', 'alice@example.com', 'hunter2', 'sk_live_12345', 'tok_abc987');
+            INSERT INTO people (
+                id, name, email, password, api_key, secret_token, prompt_tokens
+            )
+            VALUES (
+                1, 'Alice', 'alice@example.com', 'hunter2', 'sk_live_12345', 'tok_abc987', 1420
+            );
             """
         )
         conn.commit()
@@ -58,9 +63,10 @@ class TestSQLiteGuardServer(unittest.TestCase):
         payload = _parse_payload(res)
         self.assertTrue(res["isError"])
         self.assertEqual(payload["error"], "Query execution failed or timed out.")
+        self.assertEqual(payload["reason"], "blocked by C-API security authorizer")
 
-    def test_authorizer_masks_sensitive_columns_on_read(self) -> None:
-        """`SELECT *` masks sensitive columns as NULL via SQLITE_IGNORE and blocks WHERE probes."""
+    def test_authorizer_masks_sensitive_columns_without_false_positives(self) -> None:
+        """Masks secret columns as NULL while keeping benign `prompt_tokens` visible."""
         res = execute_guarded_query(self.db_path, "SELECT * FROM people WHERE id = 1")
         payload = _parse_payload(res)
         self.assertFalse(res["isError"])
@@ -68,6 +74,7 @@ class TestSQLiteGuardServer(unittest.TestCase):
         row = payload["rows"][0]
         self.assertEqual(row["name"], "Alice")
         self.assertEqual(row["email"], "alice@example.com")
+        self.assertEqual(row["prompt_tokens"], 1420)
         self.assertIsNone(row["password"])
         self.assertIsNone(row["api_key"])
         self.assertIsNone(row["secret_token"])
@@ -81,7 +88,7 @@ class TestSQLiteGuardServer(unittest.TestCase):
         self.assertEqual(blind_payload["row_count"], 0)
 
     def test_authorizer_allows_pragma_index_list_and_explain(self) -> None:
-        """Agents can run `PRAGMA index_list`, `describe_table`, and `EXPLAIN QUERY PLAN`."""
+        """Agents can run `PRAGMA index_list`, `describe_table`, and parameterized `explain_query`."""
         pragma_res = execute_guarded_query(self.db_path, "PRAGMA index_list('people')")
         pragma_payload = _parse_payload(pragma_res)
         self.assertFalse(pragma_res["isError"])
@@ -95,7 +102,8 @@ class TestSQLiteGuardServer(unittest.TestCase):
 
         explain_res = explain_query(
             self.db_path,
-            "SELECT id, name FROM people WHERE email = 'alice@example.com'",
+            "SELECT id, name FROM people WHERE email = ?",
+            params=["alice@example.com"],
         )
         explain_payload = _parse_payload(explain_res)
         self.assertFalse(explain_res["isError"])
@@ -145,15 +153,21 @@ class TestSQLiteGuardServer(unittest.TestCase):
         payload = _parse_payload(res)
         self.assertTrue(res["isError"])
         self.assertEqual(payload["error"], "Query execution failed or timed out.")
+        self.assertEqual(payload["reason"], "exceeded timeout or VM step limit")
 
     def test_mcp_jsonrpc_server_tools(self) -> None:
         """Verify end-to-end JSON-RPC 2.0 `tools/list` and `tools/call` responses."""
         server = SQLiteGuardServer(self.db_path)
         tools_resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert tools_resp is not None
-        names = {t["name"] for t in tools_resp["result"]["tools"]}
-        self.assertEqual({"read_query", "list_tables", "describe_table", "explain_query"}, names)
+        tools_by_name = {t["name"]: t for t in tools_resp["result"]["tools"]}
+        self.assertEqual(
+            {"read_query", "list_tables", "describe_table", "explain_query"},
+            set(tools_by_name.keys()),
+        )
+        self.assertIn("params", tools_by_name["explain_query"]["inputSchema"]["properties"])
 
 
 if __name__ == "__main__":
     unittest.main()
+    
