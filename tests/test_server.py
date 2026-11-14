@@ -54,16 +54,25 @@ class TestSQLiteGuardServer(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
 
-    def test_authorizer_blocks_write_inside_cte(self) -> None:
-        """Proves `_authorize` catches write-capable CTEs that bypass regex checks."""
-        res = execute_guarded_query(
-            self.db_path,
+    def test_authorizer_blocks_write_and_explain_write(self) -> None:
+        """Proves `_authorize` blocks writes that bypass leading-verb regex checks."""
+        for sql in (
             "WITH changed AS (DELETE FROM people RETURNING id) SELECT * FROM changed",
+            "EXPLAIN DELETE FROM people WHERE id = 1",
+        ):
+            res = execute_guarded_query(self.db_path, sql)
+            payload = _parse_payload(res)
+            self.assertTrue(res["isError"])
+            self.assertEqual(payload["error"], "Query execution failed or timed out.")
+
+        explain_write = execute_guarded_query(
+            self.db_path,
+            "EXPLAIN DELETE FROM people WHERE id = 1",
         )
-        payload = _parse_payload(res)
-        self.assertTrue(res["isError"])
-        self.assertEqual(payload["error"], "Query execution failed or timed out.")
-        self.assertEqual(payload["reason"], "blocked by C-API security authorizer")
+        self.assertEqual(
+            _parse_payload(explain_write)["reason"],
+            "blocked by C-API security authorizer",
+        )
 
     def test_authorizer_masks_sensitive_columns_without_false_positives(self) -> None:
         """Masks secret columns as NULL while keeping benign `prompt_tokens` visible."""
@@ -88,7 +97,7 @@ class TestSQLiteGuardServer(unittest.TestCase):
         self.assertEqual(blind_payload["row_count"], 0)
 
     def test_authorizer_allows_pragma_index_list_and_explain(self) -> None:
-        """Agents can run `PRAGMA index_list`, `describe_table`, and parameterized `explain_query`."""
+        """Agents can run `PRAGMA index_list`, `describe_table`, and `explain_query`."""
         pragma_res = execute_guarded_query(self.db_path, "PRAGMA index_list('people')")
         pragma_payload = _parse_payload(pragma_res)
         self.assertFalse(pragma_res["isError"])
@@ -122,6 +131,7 @@ class TestSQLiteGuardServer(unittest.TestCase):
             payload = _parse_payload(res)
             self.assertTrue(res["isError"])
             self.assertEqual(payload["error"], "Query execution failed or timed out.")
+            self.assertEqual(payload["reason"], "blocked by C-API security authorizer")
 
     def test_blocked_functions_rejected(self) -> None:
         """Dangerous SQLite functions (`randomblob`, `load_extension`) are denied."""
@@ -133,6 +143,7 @@ class TestSQLiteGuardServer(unittest.TestCase):
             payload = _parse_payload(res)
             self.assertTrue(res["isError"])
             self.assertEqual(payload["error"], "Query execution failed or timed out.")
+            self.assertEqual(payload["reason"], "blocked by C-API security authorizer")
 
     def test_progress_handler_aborts_runaway_query(self) -> None:
         """Runaway recursive CTEs exceeding the VM instruction budget fail deterministically."""
@@ -170,4 +181,4 @@ class TestSQLiteGuardServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-    
+        
