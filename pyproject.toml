@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlite-guard-mcp"
+version = "0.1.1"
+description = "A sandboxed, read-only MCP server for exploring a local SQLite database."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=1.2.0,<2.0.0",
+]
+
+[project.scripts]
+sqlite-guard-mcp = "sqlite_guard_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlite_guard_mcp"]
