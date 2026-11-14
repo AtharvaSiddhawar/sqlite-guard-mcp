@@ -67,10 +67,9 @@ _NOARG_READ_PRAGMAS: frozenset[str] = frozenset(
 
 _ALLOWED_PRAGMAS: frozenset[str] = _TABLE_INSPECTION_PRAGMAS | _NOARG_READ_PRAGMAS
 
-_SENSITIVE_COLUMN_PATTERNS: tuple[str, ...] = (
+_SENSITIVE_SUBSTRING_PATTERNS: tuple[str, ...] = (
     "password",
     "passwd",
-    "token",
     "secret",
     "api_key",
     "apikey",
@@ -78,6 +77,16 @@ _SENSITIVE_COLUMN_PATTERNS: tuple[str, ...] = (
     "ssn",
     "credential",
     "auth_key",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "session_token",
+    "bearer_token",
+    "client_token",
+    "reset_token",
+    "csrf_token",
+    "token_hash",
 )
 
 
@@ -90,8 +99,10 @@ def _is_sensitive_column(column_name: str | None) -> bool:
     """Return True if `column_name` matches a sensitive credential or secret pattern."""
     if not column_name:
         return False
-    lowered = column_name.lower()
-    return any(pattern in lowered for pattern in _SENSITIVE_COLUMN_PATTERNS)
+    lowered = column_name.lower().strip()
+    if lowered in {"token", "tokens"}:
+        return True
+    return any(pattern in lowered for pattern in _SENSITIVE_SUBSTRING_PATTERNS)
 
 
 def _authorize(
@@ -253,8 +264,20 @@ def execute_guarded_query(
             },
             is_error=False,
         )
-    except (sqlite3.Error, sqlite3.Warning):
-        return _json_result({"error": "Query execution failed or timed out."})
+    except (sqlite3.Error, sqlite3.Warning) as exc:
+        msg = str(exc).lower()
+        if "not authorized" in msg or "prohibited" in msg:
+            reason = "blocked by C-API security authorizer"
+        elif "interrupted" in msg:
+            reason = "exceeded timeout or VM step limit"
+        else:
+            reason = str(exc)
+        return _json_result(
+            {
+                "error": "Query execution failed or timed out.",
+                "reason": reason,
+            }
+        )
     finally:
         conn.close()
 
@@ -413,7 +436,11 @@ class SQLiteGuardServer:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sql": {"type": "string", "description": "SELECT or WITH query."}
+                        "sql": {"type": "string", "description": "SELECT or WITH query."},
+                        "params": {
+                            "type": ["object", "array"],
+                            "description": "Optional bound query parameters.",
+                        },
                     },
                     "required": ["sql"],
                     "additionalProperties": False,
@@ -559,3 +586,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+        
