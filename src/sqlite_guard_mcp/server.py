@@ -1,25 +1,6 @@
-```python
 """
 sqlite-guard-mcp: Deterministic, zero-setup, sandboxed Model Context Protocol (MCP)
 server for local SQLite databases.
-
-Security & Architectural Guarantees:
-1. C-API Read-Only Enforcement: Opens connections with `mode=ro`, `PRAGMA query_only = ON`,
-   and `PRAGMA trusted_schema = OFF`.
-2. Compile-Time Authorizer (`_authorize`):
-   - Blocks all write operations (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `ATTACH`),
-     including write-capable CTE smuggling (`WITH changed AS (DELETE ... RETURNING *) SELECT *`).
-   - Returns `sqlite3.SQLITE_IGNORE` on `sqlite3.SQLITE_READ` when `arg2` (column name) matches
-     sensitive patterns (`password`, `token`, `secret`, `api_key`, `private_key`, `ssn`),
-     masking values as `NULL` in compiled SQLite bytecode (protecting both `SELECT *` and
-     boolean blind `WHERE password LIKE ...` side-channel probes).
-   - Permits read-only schema and index introspection (`PRAGMA table_info`, `PRAGMA table_xinfo`,
-     `PRAGMA index_list`, `PRAGMA index_info`, `PRAGMA index_xinfo`, `PRAGMA foreign_key_list`)
-     and `EXPLAIN` / `EXPLAIN QUERY PLAN` so agents can verify index usage before querying.
-   - Blocks dangerous SQLite functions (`load_extension`, `readfile`, `writefile`,
-     `fts3_tokenizer`, `edit`, `randomblob`, `zeroblob`).
-3. Resource & Timeout Guards: Combines `connection.setlimit()` with `set_progress_handler()`
-   (default 2.0-second timeout and 250,000 VM instruction budget) and bounded row fetching.
 """
 
 from __future__ import annotations
@@ -45,7 +26,6 @@ SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = (
 )
 DEFAULT_PROTOCOL_VERSION = "2026-07-28"
 
-# Strip leading SQL comments before validating statement verb
 _LEADING_COMMENTS_RE = re.compile(
     r"^\s*(?:(?:--[^\r\n]*[\r\n]+)|(?:/\*[\s\S]*?\*/\s*))+",
     re.MULTILINE,
@@ -53,7 +33,6 @@ _LEADING_COMMENTS_RE = re.compile(
 _READ_QUERY_RE = re.compile(r"^\s*(SELECT|WITH|EXPLAIN|PRAGMA)\b", re.IGNORECASE)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Dangerous SQLite functions blocked at compile time via SQLITE_FUNCTION
 _BLOCKED_FUNCTIONS: frozenset[str] = frozenset(
     {
         "load_extension",
@@ -66,7 +45,6 @@ _BLOCKED_FUNCTIONS: frozenset[str] = frozenset(
     }
 )
 
-# Table/index inspection PRAGMAs that take a table or index identifier in `arg2`
 _TABLE_INSPECTION_PRAGMAS: frozenset[str] = frozenset(
     {
         "table_info",
@@ -78,7 +56,6 @@ _TABLE_INSPECTION_PRAGMAS: frozenset[str] = frozenset(
     }
 )
 
-# Read-only zero-argument PRAGMAs where `arg2` must be None (prevents PRAGMA setting)
 _NOARG_READ_PRAGMAS: frozenset[str] = frozenset(
     {
         "database_list",
@@ -88,10 +65,8 @@ _NOARG_READ_PRAGMAS: frozenset[str] = frozenset(
     }
 )
 
-# Combined set of allowed read-only PRAGMAs
 _ALLOWED_PRAGMAS: frozenset[str] = _TABLE_INSPECTION_PRAGMAS | _NOARG_READ_PRAGMAS
 
-# Sensitive column substrings automatically masked to NULL via SQLITE_IGNORE on SQLITE_READ
 _SENSITIVE_COLUMN_PATTERNS: tuple[str, ...] = (
     "password",
     "passwd",
@@ -107,7 +82,7 @@ _SENSITIVE_COLUMN_PATTERNS: tuple[str, ...] = (
 
 
 def _strip_leading_comments(sql: str) -> str:
-    """Remove leading `--` and `/* ... */` comments so valid queries with comments are accepted."""
+    """Remove leading `--` and `/* ... */` comments before checking statement verb."""
     return _LEADING_COMMENTS_RE.sub("", sql or "").strip()
 
 
@@ -131,9 +106,9 @@ def _authorize(
 
     - Permits `SQLITE_SELECT` and `SQLITE_RECURSIVE`
     - Masks sensitive columns as `NULL` via `SQLITE_IGNORE` on `SQLITE_READ`
-    - Permits read-only schema/index PRAGMAs (`table_info`, `index_list`, `index_info`, `foreign_key_list`)
+    - Permits read-only schema and index PRAGMAs (`table_info`, `index_list`, `index_info`)
     - Blocks `_BLOCKED_FUNCTIONS` (`load_extension`, `readfile`, `writefile`, `fts3_tokenizer`)
-    - Denies all writes (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ATTACH`, `ALTER`) including CTE writes
+    - Denies all writes (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ATTACH`, `ALTER`)
     """
     if action == sqlite3.SQLITE_SELECT:
         return sqlite3.SQLITE_OK
@@ -193,11 +168,9 @@ def _open_guarded_connection(
     conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds, isolation_level=None)
     conn.row_factory = sqlite3.Row
 
-    # Enforce C-API defensive PRAGMAs before installing the compile-time authorizer
     conn.execute("PRAGMA query_only = ON;")
     conn.execute("PRAGMA trusted_schema = OFF;")
 
-    # Apply C-API runtime limits where supported by Python's sqlite3 module
     if hasattr(conn, "setlimit"):
         for limit_attr, limit_val in (
             ("SQLITE_LIMIT_SQL_LENGTH", 100_000),
@@ -239,10 +212,7 @@ def execute_guarded_query(
     timeout_seconds: float = 2.0,
     max_vm_steps: int = 250_000,
 ) -> dict[str, Any]:
-    """
-    Execute a read-only SQL query (`SELECT`, `WITH`, `EXPLAIN`, or allowed `PRAGMA`)
-    inside the deterministic SQLite sandbox and return an MCP tool result dict.
-    """
+    """Execute a read-only SQL query inside the deterministic SQLite sandbox."""
     cleaned_sql = (sql or "").strip()
     uncommented_sql = _strip_leading_comments(cleaned_sql)
     if not uncommented_sql:
@@ -250,11 +220,7 @@ def execute_guarded_query(
 
     if not _READ_QUERY_RE.match(uncommented_sql):
         return _json_result(
-            {
-                "error": (
-                    "Only read-only SELECT, WITH, EXPLAIN, or allowed PRAGMA statements are permitted."
-                )
-            }
+            {"error": "Only read-only SELECT, WITH, EXPLAIN, or PRAGMA statements are allowed."}
         )
 
     try:
@@ -293,7 +259,6 @@ def execute_guarded_query(
         conn.close()
 
 
-# Alias for backwards compatibility with callers importing `execute_query`
 execute_query = execute_guarded_query
 
 
@@ -312,7 +277,7 @@ def list_tables(db_path: str | Path) -> dict[str, Any]:
 
 
 def describe_table(db_path: str | Path, table_name: str) -> dict[str, Any]:
-    """Return column metadata (`PRAGMA table_info`) and index metadata (`PRAGMA index_list`) for a table."""
+    """Return column metadata (`table_info`) and index metadata (`index_list`) for a table."""
     cleaned = (table_name or "").strip()
     if not _IDENTIFIER_RE.match(cleaned):
         return _json_result({"error": "Invalid table name."})
@@ -366,7 +331,7 @@ def explain_query(
     sql: str,
     params: dict[str, Any] | list[Any] | tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
-    """Run `EXPLAIN QUERY PLAN` on a read-only SQL query to inspect index usage before execution."""
+    """Run `EXPLAIN QUERY PLAN` on a read-only SQL query to inspect index usage."""
     cleaned_sql = _strip_leading_comments(sql or "")
     if not cleaned_sql:
         return _json_result({"error": "SQL query must not be empty."})
@@ -402,14 +367,13 @@ class SQLiteGuardServer:
             {
                 "name": "read_query",
                 "description": (
-                    "Execute a read-only SQLite query (`SELECT`, `WITH`, `EXPLAIN QUERY PLAN`, or "
-                    "allowed `PRAGMA` such as `PRAGMA index_list`). Enforces C-API read-only mode, "
-                    "2-second execution timeout, and automatic NULL masking on sensitive columns."
+                    "Execute a read-only SQLite query (`SELECT`, `WITH`, `EXPLAIN QUERY PLAN`, "
+                    "or allowed `PRAGMA` such as `PRAGMA index_list`)."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sql": {"type": "string", "description": "Read-only SQL statement to run."},
+                        "sql": {"type": "string", "description": "Read-only SQL statement."},
                         "params": {
                             "type": ["object", "array"],
                             "description": "Optional bound query parameters.",
@@ -431,7 +395,7 @@ class SQLiteGuardServer:
             {
                 "name": "describe_table",
                 "description": (
-                    "Inspect columns (`PRAGMA table_info`), indexes (`PRAGMA index_list` / `index_info`), "
+                    "Inspect columns (`PRAGMA table_info`), indexes (`PRAGMA index_list`), "
                     "foreign keys, and sensitive column masking status for a table."
                 ),
                 "inputSchema": {
@@ -445,14 +409,11 @@ class SQLiteGuardServer:
             },
             {
                 "name": "explain_query",
-                "description": (
-                    "Run `EXPLAIN QUERY PLAN` on a SELECT/WITH query to verify index usage and "
-                    "avoid full-table scans before hitting the execution timeout."
-                ),
+                "description": "Run `EXPLAIN QUERY PLAN` on a SELECT/WITH query.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sql": {"type": "string", "description": "SELECT or WITH query to explain."}
+                        "sql": {"type": "string", "description": "SELECT or WITH query."}
                     },
                     "required": ["sql"],
                     "additionalProperties": False,
@@ -548,6 +509,9 @@ class SQLiteGuardServer:
                 stdout.flush()
 
 
+SQLiteGuardMCPServer = SQLiteGuardServer
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="sqlite-guard-mcp",
@@ -556,6 +520,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "db_positional",
         nargs="?",
-        help="Path to the SQLite database file (can also be passed via --db or SQLITE_GUARD_DB).",
+        help="Path to the SQLite database file.",
     )
-    parser.add_argument("--db", de
+    parser.add_argument("--db", dest="db_flag", help="Path to the SQLite database file.")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=250,
+        help="Maximum rows returned per query.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=2.0,
+        help="Maximum query execution timeout in seconds (default: 2.0).",
+    )
+    parser.add_argument(
+        "--max-vm-steps",
+        type=int,
+        default=250_000,
+        help="Maximum SQLite VM steps before aborting (default: 250000).",
+    )
+    args = parser.parse_args(argv)
+
+    db_target = args.db_flag or args.db_positional or os.environ.get("SQLITE_GUARD_DB")
+    if not db_target:
+        parser.error("A SQLite database path is required (pass `--db /path/to/db.sqlite`).")
+
+    server = SQLiteGuardServer(
+        db_target,
+        max_rows=args.max_rows,
+        timeout_seconds=args.timeout,
+        max_vm_steps=args.max_vm_steps,
+    )
+    server.serve_stdio()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
