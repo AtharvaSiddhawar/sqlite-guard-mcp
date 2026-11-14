@@ -1,239 +1,561 @@
-"""Bounded, read-only access to one SQLite database."""
+```python
+"""
+sqlite-guard-mcp: Deterministic, zero-setup, sandboxed Model Context Protocol (MCP)
+server for local SQLite databases.
+
+Security & Architectural Guarantees:
+1. C-API Read-Only Enforcement: Opens connections with `mode=ro`, `PRAGMA query_only = ON`,
+   and `PRAGMA trusted_schema = OFF`.
+2. Compile-Time Authorizer (`_authorize`):
+   - Blocks all write operations (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `ATTACH`),
+     including write-capable CTE smuggling (`WITH changed AS (DELETE ... RETURNING *) SELECT *`).
+   - Returns `sqlite3.SQLITE_IGNORE` on `sqlite3.SQLITE_READ` when `arg2` (column name) matches
+     sensitive patterns (`password`, `token`, `secret`, `api_key`, `private_key`, `ssn`),
+     masking values as `NULL` in compiled SQLite bytecode (protecting both `SELECT *` and
+     boolean blind `WHERE password LIKE ...` side-channel probes).
+   - Permits read-only schema and index introspection (`PRAGMA table_info`, `PRAGMA table_xinfo`,
+     `PRAGMA index_list`, `PRAGMA index_info`, `PRAGMA index_xinfo`, `PRAGMA foreign_key_list`)
+     and `EXPLAIN` / `EXPLAIN QUERY PLAN` so agents can verify index usage before querying.
+   - Blocks dangerous SQLite functions (`load_extension`, `readfile`, `writefile`,
+     `fts3_tokenizer`, `edit`, `randomblob`, `zeroblob`).
+3. Resource & Timeout Guards: Combines `connection.setlimit()` with `set_progress_handler()`
+   (default 2.0-second timeout and 250,000 VM instruction budget) and bounded row fetching.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
-import math
+import os
 import re
 import sqlite3
+import sys
 import time
-from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
+from urllib.parse import quote
 
-MAX_ROWS = 200
-MAX_SQL_LENGTH = 100_000
-QUERY_TIMEOUT_SECONDS = 2.0
-PROGRESS_INTERVAL = 1_000
+__version__ = "0.1.0"
 
-_READ_ACTIONS = {
-    sqlite3.SQLITE_SELECT,
-    sqlite3.SQLITE_READ,
-    sqlite3.SQLITE_FUNCTION,
-}
-if hasattr(sqlite3, "SQLITE_RECURSIVE"):
-    _READ_ACTIONS.add(sqlite3.SQLITE_RECURSIVE)
+SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = (
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2024-11-05",
+)
+DEFAULT_PROTOCOL_VERSION = "2026-07-28"
 
-_BLOCKED_FUNCTIONS = {
-    "current_date",
-    "current_time",
-    "current_timestamp",
-    "fts3_tokenizer",
-    "last_insert_rowid",
-    "load_extension",
-    "random",
-    "randomblob",
-    "readfile",
-    "total_changes",
-    "writefile",
-}
+# Strip leading SQL comments before validating statement verb
+_LEADING_COMMENTS_RE = re.compile(
+    r"^\s*(?:(?:--[^\r\n]*[\r\n]+)|(?:/\*[\s\S]*?\*/\s*))+",
+    re.MULTILINE,
+)
+_READ_QUERY_RE = re.compile(r"^\s*(SELECT|WITH|EXPLAIN|PRAGMA)\b", re.IGNORECASE)
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-_ALLOWED_QUERY_START = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+# Dangerous SQLite functions blocked at compile time via SQLITE_FUNCTION
+_BLOCKED_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "load_extension",
+        "readfile",
+        "writefile",
+        "fts3_tokenizer",
+        "edit",
+        "randomblob",
+        "zeroblob",
+    }
+)
+
+# Table/index inspection PRAGMAs that take a table or index identifier in `arg2`
+_TABLE_INSPECTION_PRAGMAS: frozenset[str] = frozenset(
+    {
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "index_info",
+        "index_xinfo",
+        "foreign_key_list",
+    }
+)
+
+# Read-only zero-argument PRAGMAs where `arg2` must be None (prevents PRAGMA setting)
+_NOARG_READ_PRAGMAS: frozenset[str] = frozenset(
+    {
+        "database_list",
+        "compile_options",
+        "encoding",
+        "data_version",
+    }
+)
+
+# Combined set of allowed read-only PRAGMAs
+_ALLOWED_PRAGMAS: frozenset[str] = _TABLE_INSPECTION_PRAGMAS | _NOARG_READ_PRAGMAS
+
+# Sensitive column substrings automatically masked to NULL via SQLITE_IGNORE on SQLITE_READ
+_SENSITIVE_COLUMN_PATTERNS: tuple[str, ...] = (
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "private_key",
+    "ssn",
+    "credential",
+    "auth_key",
+)
 
 
-def _json_default(value: Any) -> Any:
-    """Convert SQLite values that JSON cannot encode by default."""
-    if isinstance(value, bytes):
-        return {"encoding": "hex", "value": value.hex()}
-    return str(value)
+def _strip_leading_comments(sql: str) -> str:
+    """Remove leading `--` and `/* ... */` comments so valid queries with comments are accepted."""
+    return _LEADING_COMMENTS_RE.sub("", sql or "").strip()
 
 
-def _json_result(value: Any) -> str:
-    """Encode a result as JSON text for MCP clients."""
-    return json.dumps(value, ensure_ascii=False, default=_json_default)
+def _is_sensitive_column(column_name: str | None) -> bool:
+    """Return True if `column_name` matches a sensitive credential or secret pattern."""
+    if not column_name:
+        return False
+    lowered = column_name.lower()
+    return any(pattern in lowered for pattern in _SENSITIVE_COLUMN_PATTERNS)
 
 
-class SQLiteGuard:
-    """Read-only access to one SQLite database with bounded query execution."""
+def _authorize(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    db_name: str | None,
+    trigger_or_view: str | None,
+) -> int:
+    """
+    Deterministic SQLite C-API compile-time authorizer callback.
+
+    - Permits `SQLITE_SELECT` and `SQLITE_RECURSIVE`
+    - Masks sensitive columns as `NULL` via `SQLITE_IGNORE` on `SQLITE_READ`
+    - Permits read-only schema/index PRAGMAs (`table_info`, `index_list`, `index_info`, `foreign_key_list`)
+    - Blocks `_BLOCKED_FUNCTIONS` (`load_extension`, `readfile`, `writefile`, `fts3_tokenizer`)
+    - Denies all writes (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ATTACH`, `ALTER`) including CTE writes
+    """
+    if action == sqlite3.SQLITE_SELECT:
+        return sqlite3.SQLITE_OK
+
+    if action == sqlite3.SQLITE_READ:
+        if _is_sensitive_column(arg2):
+            return sqlite3.SQLITE_IGNORE
+        return sqlite3.SQLITE_OK
+
+    if action == sqlite3.SQLITE_PRAGMA:
+        pragma_name = (arg1 or "").lower()
+        if pragma_name in _TABLE_INSPECTION_PRAGMAS:
+            return sqlite3.SQLITE_OK
+        if pragma_name in _NOARG_READ_PRAGMAS and arg2 is None:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    if action == getattr(sqlite3, "SQLITE_FUNCTION", 31):
+        fn_name = (arg2 or "").lower()
+        if fn_name in _BLOCKED_FUNCTIONS:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    if action == getattr(sqlite3, "SQLITE_RECURSIVE", 33):
+        return sqlite3.SQLITE_OK
+
+    return sqlite3.SQLITE_DENY
+
+
+def _json_result(payload: dict[str, Any], *, is_error: bool | None = None) -> dict[str, Any]:
+    """Wrap a structured dictionary payload into an MCP tool result block."""
+    if is_error is None:
+        is_error = "error" in payload
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(payload, indent=2, default=str),
+            }
+        ],
+        "isError": is_error,
+    }
+
+
+def _open_guarded_connection(
+    db_path: Path,
+    timeout_seconds: float = 2.0,
+    max_vm_steps: int = 250_000,
+) -> sqlite3.Connection:
+    """Open a read-only, C-API hardened SQLite connection with authorizer and progress limits."""
+    resolved = db_path.expanduser().resolve()
+    if not resolved.exists() or not resolved.is_file():
+        raise FileNotFoundError(f"SQLite database not found: {resolved}")
+
+    encoded_path = quote(str(resolved), safe="/:\\")
+    uri = f"file:{encoded_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=timeout_seconds, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+
+    # Enforce C-API defensive PRAGMAs before installing the compile-time authorizer
+    conn.execute("PRAGMA query_only = ON;")
+    conn.execute("PRAGMA trusted_schema = OFF;")
+
+    # Apply C-API runtime limits where supported by Python's sqlite3 module
+    if hasattr(conn, "setlimit"):
+        for limit_attr, limit_val in (
+            ("SQLITE_LIMIT_SQL_LENGTH", 100_000),
+            ("SQLITE_LIMIT_EXPR_DEPTH", 100),
+            ("SQLITE_LIMIT_COMPOUND_SELECT", 10),
+            ("SQLITE_LIMIT_ATTACHED", 0),
+        ):
+            limit_id = getattr(sqlite3, limit_attr, None)
+            if limit_id is not None:
+                try:
+                    conn.setlimit(limit_id, limit_val)
+                except sqlite3.Error:
+                    pass
+
+    start_time = time.monotonic()
+    batches = 0
+    batch_size = 1_000
+
+    def _progress_handler() -> int:
+        nonlocal batches
+        batches += 1
+        if batches * batch_size > max_vm_steps:
+            return 1
+        if (time.monotonic() - start_time) > timeout_seconds:
+            return 1
+        return 0
+
+    conn.set_progress_handler(_progress_handler, batch_size)
+    conn.set_authorizer(_authorize)
+    return conn
+
+
+def execute_guarded_query(
+    db_path: str | Path,
+    sql: str,
+    params: dict[str, Any] | list[Any] | tuple[Any, ...] | None = None,
+    *,
+    max_rows: int = 250,
+    timeout_seconds: float = 2.0,
+    max_vm_steps: int = 250_000,
+) -> dict[str, Any]:
+    """
+    Execute a read-only SQL query (`SELECT`, `WITH`, `EXPLAIN`, or allowed `PRAGMA`)
+    inside the deterministic SQLite sandbox and return an MCP tool result dict.
+    """
+    cleaned_sql = (sql or "").strip()
+    uncommented_sql = _strip_leading_comments(cleaned_sql)
+    if not uncommented_sql:
+        return _json_result({"error": "SQL query must not be empty."})
+
+    if not _READ_QUERY_RE.match(uncommented_sql):
+        return _json_result(
+            {
+                "error": (
+                    "Only read-only SELECT, WITH, EXPLAIN, or allowed PRAGMA statements are permitted."
+                )
+            }
+        )
+
+    try:
+        conn = _open_guarded_connection(
+            Path(db_path),
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+    except FileNotFoundError:
+        return _json_result({"error": "Database file not found."})
+    except (sqlite3.Error, sqlite3.Warning):
+        return _json_result({"error": "Failed to open read-only database connection."})
+
+    start = time.perf_counter()
+    try:
+        cursor = conn.execute(cleaned_sql, params or ())
+        fetched = cursor.fetchmany(max_rows + 1)
+        truncated = len(fetched) > max_rows
+        bounded = fetched[:max_rows]
+        columns = [col[0] for col in (cursor.description or [])]
+        rows = [dict(row) for row in bounded]
+        elapsed_ms = round((time.perf_counter() - start) * 1000.0, 3)
+        return _json_result(
+            {
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": truncated,
+                "elapsed_ms": elapsed_ms,
+            },
+            is_error=False,
+        )
+    except (sqlite3.Error, sqlite3.Warning):
+        return _json_result({"error": "Query execution failed or timed out."})
+    finally:
+        conn.close()
+
+
+# Alias for backwards compatibility with callers importing `execute_query`
+execute_query = execute_guarded_query
+
+
+def list_tables(db_path: str | Path) -> dict[str, Any]:
+    """List all user tables and views in the SQLite database."""
+    return execute_guarded_query(
+        db_path,
+        """
+        SELECT name, type
+        FROM sqlite_master
+        WHERE type IN ('table', 'view')
+          AND name NOT LIKE 'sqlite_%'
+        ORDER BY name ASC;
+        """,
+    )
+
+
+def describe_table(db_path: str | Path, table_name: str) -> dict[str, Any]:
+    """Return column metadata (`PRAGMA table_info`) and index metadata (`PRAGMA index_list`) for a table."""
+    cleaned = (table_name or "").strip()
+    if not _IDENTIFIER_RE.match(cleaned):
+        return _json_result({"error": "Invalid table name."})
+
+    try:
+        conn = _open_guarded_connection(Path(db_path))
+    except (FileNotFoundError, sqlite3.Error, sqlite3.Warning):
+        return _json_result({"error": "Failed to open read-only database connection."})
+
+    try:
+        cols_cur = conn.execute(f'PRAGMA table_info("{cleaned}");')
+        columns = []
+        for row in cols_cur.fetchall():
+            col_dict = dict(row)
+            col_dict["masked_by_guard"] = _is_sensitive_column(str(col_dict.get("name", "")))
+            columns.append(col_dict)
+
+        if not columns:
+            return _json_result({"error": f"Table '{cleaned}' not found."})
+
+        idx_cur = conn.execute(f'PRAGMA index_list("{cleaned}");')
+        indexes = []
+        for idx_row in idx_cur.fetchall():
+            idx_dict = dict(idx_row)
+            idx_name = str(idx_dict.get("name", ""))
+            if _IDENTIFIER_RE.match(idx_name):
+                info_cur = conn.execute(f'PRAGMA index_info("{idx_name}");')
+                idx_dict["columns"] = [dict(r) for r in info_cur.fetchall()]
+            indexes.append(idx_dict)
+
+        fk_cur = conn.execute(f'PRAGMA foreign_key_list("{cleaned}");')
+        foreign_keys = [dict(r) for r in fk_cur.fetchall()]
+
+        return _json_result(
+            {
+                "table": cleaned,
+                "columns": columns,
+                "indexes": indexes,
+                "foreign_keys": foreign_keys,
+            },
+            is_error=False,
+        )
+    except (sqlite3.Error, sqlite3.Warning):
+        return _json_result({"error": "Schema inspection failed or timed out."})
+    finally:
+        conn.close()
+
+
+def explain_query(
+    db_path: str | Path,
+    sql: str,
+    params: dict[str, Any] | list[Any] | tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    """Run `EXPLAIN QUERY PLAN` on a read-only SQL query to inspect index usage before execution."""
+    cleaned_sql = _strip_leading_comments(sql or "")
+    if not cleaned_sql:
+        return _json_result({"error": "SQL query must not be empty."})
+    if not re.match(r"^\s*(SELECT|WITH|EXPLAIN)\b", cleaned_sql, re.IGNORECASE):
+        return _json_result({"error": "Only SELECT or WITH queries can be explained."})
+
+    explain_sql = (
+        cleaned_sql
+        if re.match(r"^\s*EXPLAIN\b", cleaned_sql, re.IGNORECASE)
+        else f"EXPLAIN QUERY PLAN {cleaned_sql}"
+    )
+    return execute_guarded_query(db_path, explain_sql, params=params)
+
+
+class SQLiteGuardServer:
+    """MCP JSON-RPC 2.0 stdio server wrapping deterministic SQLite C-API guards."""
 
     def __init__(
         self,
-        database_path: str | Path,
+        db_path: str | Path,
         *,
-        max_rows: int = MAX_ROWS,
-        query_timeout_seconds: float = QUERY_TIMEOUT_SECONDS,
+        max_rows: int = 250,
+        timeout_seconds: float = 2.0,
+        max_vm_steps: int = 250_000,
     ) -> None:
-        path = Path(database_path).expanduser().resolve(strict=True)
-        if not path.is_file():
-            raise ValueError(f"Database path is not a file: {path}")
-        if isinstance(max_rows, bool) or not isinstance(max_rows, int):
-            raise ValueError("max_rows must be an integer between 1 and 1000")
-        if not 1 <= max_rows <= 1_000:
-            raise ValueError("max_rows must be between 1 and 1000")
-        if (
-            isinstance(query_timeout_seconds, bool)
-            or not isinstance(query_timeout_seconds, (int, float))
-            or not math.isfinite(query_timeout_seconds)
-            or query_timeout_seconds <= 0
-        ):
-            raise ValueError("query_timeout_seconds must be a positive finite number")
-
-        self.database_path = path
+        self.db_path = Path(db_path).expanduser().resolve()
         self.max_rows = max_rows
-        self.query_timeout_seconds = float(query_timeout_seconds)
-        self._database_uri = f"{path.as_uri()}?mode=ro"
+        self.timeout_seconds = timeout_seconds
+        self.max_vm_steps = max_vm_steps
 
-    @staticmethod
-    def _authorize(
-        action: int,
-        arg1: str | None,
-        arg2: str | None,
-        _database: str | None,
-        _trigger: str | None,
-    ) -> int:
-        """Allow reads, except for selected non-deterministic/sensitive functions."""
-        if action in _READ_ACTIONS:
-            if action == sqlite3.SQLITE_FUNCTION:
-                function_name = (arg2 or arg1 or "").lower()
-                if function_name in _BLOCKED_FUNCTIONS:
-                    return sqlite3.SQLITE_DENY
-            return sqlite3.SQLITE_OK
+    def get_tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "read_query",
+                "description": (
+                    "Execute a read-only SQLite query (`SELECT`, `WITH`, `EXPLAIN QUERY PLAN`, or "
+                    "allowed `PRAGMA` such as `PRAGMA index_list`). Enforces C-API read-only mode, "
+                    "2-second execution timeout, and automatic NULL masking on sensitive columns."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {"type": "string", "description": "Read-only SQL statement to run."},
+                        "params": {
+                            "type": ["object", "array"],
+                            "description": "Optional bound query parameters.",
+                        },
+                    },
+                    "required": ["sql"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "list_tables",
+                "description": "List all user tables and views in the SQLite database.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "describe_table",
+                "description": (
+                    "Inspect columns (`PRAGMA table_info`), indexes (`PRAGMA index_list` / `index_info`), "
+                    "foreign keys, and sensitive column masking status for a table."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {"type": "string", "description": "Table name to inspect."}
+                    },
+                    "required": ["table_name"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "explain_query",
+                "description": (
+                    "Run `EXPLAIN QUERY PLAN` on a SELECT/WITH query to verify index usage and "
+                    "avoid full-table scans before hitting the execution timeout."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {"type": "string", "description": "SELECT or WITH query to explain."}
+                    },
+                    "required": ["sql"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
 
-        # The server needs this pragma only for its table-description tool.
-        if action == sqlite3.SQLITE_PRAGMA and (arg1 or "").lower() == "table_info":
-            return sqlite3.SQLITE_OK
+    def handle_request(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        method = message.get("method")
+        msg_id = message.get("id")
+        params = message.get("params") or {}
 
-        return sqlite3.SQLITE_DENY
+        if msg_id is None:
+            return None
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a restricted connection to the configured database."""
-        connection = sqlite3.connect(
-            self._database_uri,
-            uri=True,
-            timeout=0.5,
-            isolation_level=None,
-        )
-        try:
-            connection.row_factory = sqlite3.Row
-
-            # Apply restrictive SQLite limits where the runtime supports them.
-            limits = (
-                ("SQLITE_LIMIT_SQL_LENGTH", MAX_SQL_LENGTH),
-                ("SQLITE_LIMIT_LENGTH", 2_000_000),
-                ("SQLITE_LIMIT_COLUMN", 200),
-                ("SQLITE_LIMIT_COMPOUND_SELECT", 50),
+        if method == "initialize":
+            requested_version = str(params.get("protocolVersion", DEFAULT_PROTOCOL_VERSION))
+            negotiated = (
+                requested_version
+                if requested_version in SUPPORTED_PROTOCOL_VERSIONS
+                else DEFAULT_PROTOCOL_VERSION
             )
-            for limit_name, limit_value in limits:
-                limit_id = getattr(sqlite3, limit_name, None)
-                if limit_id is not None and hasattr(connection, "setlimit"):
-                    connection.setlimit(limit_id, limit_value)
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "protocolVersion": negotiated,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "sqlite-guard-mcp", "version": __version__},
+                },
+            }
 
-            connection.execute("PRAGMA query_only = ON")
-            connection.execute("PRAGMA trusted_schema = OFF")
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
-            deadline = time.monotonic() + self.query_timeout_seconds
-            connection.set_progress_handler(
-                lambda: int(time.monotonic() >= deadline),
-                PROGRESS_INTERVAL,
-            )
-            connection.set_authorizer(self._authorize)
-            return connection
-        except Exception:
-            connection.close()
-            raise
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": self.get_tools()}}
 
-    def list_tables(self) -> str:
-        """Return user tables and views as JSON."""
-        try:
-            with closing(self._connect()) as connection:
-                rows = connection.execute(
-                    """
-                    SELECT name, type
-                    FROM sqlite_schema
-                    WHERE type IN ('table', 'view')
-                      AND name NOT LIKE 'sqlite_%'
-                    ORDER BY name
-                    """
-                ).fetchall()
+        if method == "tools/call":
+            tool_name = params.get("name")
+            args = params.get("arguments") or {}
 
-            return _json_result(
-                [{"name": row["name"], "type": row["type"]} for row in rows]
-            )
-        except sqlite3.Error:
-            return _json_result({"error": "Could not read the database schema."})
+            if tool_name == "read_query":
+                result = execute_guarded_query(
+                    self.db_path,
+                    str(args.get("sql", "")),
+                    args.get("params"),
+                    max_rows=self.max_rows,
+                    timeout_seconds=self.timeout_seconds,
+                    max_vm_steps=self.max_vm_steps,
+                )
+            elif tool_name == "list_tables":
+                result = list_tables(self.db_path)
+            elif tool_name == "describe_table":
+                result = describe_table(self.db_path, str(args.get("table_name", "")))
+            elif tool_name == "explain_query":
+                result = explain_query(
+                    self.db_path,
+                    str(args.get("sql", "")),
+                    args.get("params"),
+                )
+            else:
+                result = _json_result({"error": f"Unknown tool: {tool_name}"})
 
-    def describe_table(self, table_name: str) -> str:
-        """Return column details for a table or view as JSON."""
-        if not isinstance(table_name, str) or not table_name or len(table_name) > 256:
-            return _json_result({"error": "Provide a valid table name."})
+            return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
-        try:
-            with closing(self._connect()) as connection:
-                found = connection.execute(
-                    """
-                    SELECT name, type
-                    FROM sqlite_schema
-                    WHERE name = ? AND type IN ('table', 'view')
-                    """,
-                    (table_name,),
-                ).fetchone()
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
 
-                if found is None:
-                    return _json_result({"error": "Table or view not found."})
-
-                quoted_name = table_name.replace('"', '""')
-                rows = connection.execute(
-                    f'PRAGMA table_info("{quoted_name}")'
-                ).fetchall()
-
-            return _json_result(
-                {
-                    "name": found["name"],
-                    "type": found["type"],
-                    "columns": [
-                        {
-                            "name": row["name"],
-                            "type": row["type"],
-                            "not_null": bool(row["notnull"]),
-                            "default": row["dflt_value"],
-                            "primary_key_position": row["pk"],
-                        }
-                        for row in rows
-                    ],
+    def serve_stdio(self, stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout) -> None:
+        for raw_line in stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                err = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Invalid JSON payload."},
                 }
-            )
-        except sqlite3.Error:
-            return _json_result({"error": "Could not describe that table."})
+                stdout.write(json.dumps(err) + "\n")
+                stdout.flush()
+                continue
 
-    def query(self, sql: str) -> str:
-        """Run one bounded read-only SELECT or WITH query and return JSON."""
-        if not isinstance(sql, str) or len(sql) > MAX_SQL_LENGTH:
-            return _json_result({"error": "SQL must be a string within the size limit."})
+            resp = self.handle_request(msg)
+            if resp is not None:
+                stdout.write(json.dumps(resp) + "\n")
+                stdout.flush()
 
-        if not _ALLOWED_QUERY_START.match(sql):
-            return _json_result(
-                {"error": "Only a single SELECT or WITH query is allowed."}
-            )
 
-        try:
-            with closing(self._connect()) as connection:
-                cursor = connection.execute(sql)
-                if cursor.description is None:
-                    return _json_result({"error": "The query did not return rows."})
-
-                columns = [column[0] for column in cursor.description]
-                rows = cursor.fetchmany(self.max_rows + 1)
-                truncated = len(rows) > self.max_rows
-                rows = rows[: self.max_rows]
-
-            return _json_result(
-                {
-                    "columns": columns,
-                    "rows": [dict(row) for row in rows],
-                    "truncated": truncated,
-                    "max_rows": self.max_rows,
-                }
-            )
--        except sqlite3.Error as exc:
-+        except (sqlite3.Error, sqlite3.Warning) as exc:
-          )
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="sqlite-guard-mcp",
+        description="Deterministic, zero-setup, sandboxed SQLite MCP server for local AI agents.",
+    )
+    parser.add_argument(
+        "db_positional",
+        nargs="?",
+        help="Path to the SQLite database file (can also be passed via --db or SQLITE_GUARD_DB).",
+    )
+    parser.add_argument("--db", de
