@@ -1,4 +1,4 @@
-"""Allow running `python3 -m sqlite_guard_mcp` directly."""
+"""Run SQLite Guard MCP with ``python -m sqlite_guard_mcp``."""
 
 from .server import main
 
