@@ -39,7 +39,15 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          python -m pytest -v --tb=short
+          python -m pytest -v --tb=short 2>&1 | tee pytest_output.log
+          STATUS=${PIPESTATUS[0]}
+          if [ $STATUS -ne 0 ]; then
+            echo "### Pytest Failure on Python ${{ matrix.python-version }}" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            tail -n 120 pytest_output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit $STATUS
+          fi
 
       - name: Build distributions
         run: python -m build
