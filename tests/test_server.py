@@ -588,7 +588,8 @@ def test_database_corrupt_or_open_failed(tmp_path: Path, monkeypatch: pytest.Mon
     bad_db = tmp_path / "corrupt.sqlite"
     bad_db.write_text("not a valid sqlite file header")
 
-    res = execute_guarded_query(bad_db, "SELECT 1")
+    # Querying a table or schema forces SQLite to read page 1 from the corrupt file
+    res = execute_guarded_query(bad_db, "SELECT * FROM sqlite_schema")
     assert res["ok"] is False
     assert res["code"] in {"query_failed", "database_open_failed"}
 
