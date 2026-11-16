@@ -50,7 +50,7 @@ packages = ["src/sqlite_guard_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --cov=sqlite_guard_mcp --cov-report=term-missing"
 
 [tool.ruff]
 line-length = 100
@@ -61,7 +61,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.coverage.run]
 branch = true
-source = ["sqlite_guard_mcp"]
+source = ["sqlite_guard_mcp", "src/sqlite_guard_mcp"]
 
 [tool.coverage.report]
 show_missing = true
