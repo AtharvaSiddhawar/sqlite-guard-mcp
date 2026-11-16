@@ -81,31 +81,32 @@ _SAFE_TOKEN_METRICS = frozenset(
     }
 )
 
-_SENSITIVE_PARTS = (
-    "password",
-    "passwd",
-    "secret",
-    "api_key",
-    "apikey",
-    "private_key",
-    "ssn",
-    "credential",
-    "auth_key",
-    "client_secret",
-    "secret_key",
-    "access_key",
-    "authorization",
-    "cookie",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "auth_token",
-    "session_token",
-    "bearer_token",
-    "client_token",
-    "reset_token",
-    "csrf_token",
-    "token_hash",
+_SENSITIVE_PARTS = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "passphrase",
+        "secret",
+        "credential",
+        "authorization",
+        "cookie",
+        "private_key",
+        "client_secret",
+        "access_key",
+        "api_key",
+        "apikey",
+        "ssn",
+        "social_security",
+        "credit_card",
+        "card_number",
+        "cvv",
+        "cvc",
+        "tax_id",
+        "national_id",
+        "bank_account",
+        "routing_number",
+    }
 )
 
 
@@ -115,7 +116,7 @@ def _strip_leading_comments(sql: str) -> str:
 
 
 def _is_sensitive_column(name: str | None) -> bool:
-    """Return whether a column name matches the credential masking rules."""
+    """Detect common credential and sensitive-data column names."""
     if not name:
         return False
 
@@ -123,19 +124,38 @@ def _is_sensitive_column(name: str | None) -> bool:
         r"(?<=[a-z0-9])(?=[A-Z])",
         "_",
         name.strip(),
-    ).casefold()
+    )
+
+    normalized = re.sub(
+        r"[^a-zA-Z0-9]+",
+        "_",
+        normalized,
+    ).strip("_").casefold()
 
     if normalized in _SAFE_TOKEN_METRICS:
         return False
 
-    if (
-        normalized in {"token", "tokens"}
-        or "_token" in normalized
-        or normalized.startswith("token_")
-    ):
+    parts = set(normalized.split("_"))
+
+    if "token" in parts:
         return True
 
-    return any(part in normalized for part in _SENSITIVE_PARTS)
+    if parts.intersection(_SENSITIVE_PARTS):
+        return True
+
+    return any(
+        sensitive in normalized
+        for sensitive in (
+            "password",
+            "passwd",
+            "passphrase",
+            "client_secret",
+            "authorization",
+            "private_key",
+            "credential",
+            "social_security",
+        )
+    )
 
 
 def _authorize(
