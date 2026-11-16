@@ -728,6 +728,15 @@ def test_main_module(database: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert called == ["stdio"]
 
 
+def test_main_module_help(monkeypatch: pytest.MonkeyPatch) -> None:
+    import runpy
+
+    monkeypatch.setattr("sys.argv", ["sqlite-guard-mcp", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_module("sqlite_guard_mcp.__main__", run_name="__main__")
+    assert exc.value.code == 0
+
+
 def test_authorizer_direct() -> None:
     from sqlite_guard_mcp.server import _authorize
 

@@ -51,7 +51,8 @@ packages = ["src/sqlite_guard_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra --cov=src/sqlite_guard_mcp --cov-report=term-missing"
+# Standard test options and coverage targeting the installed module
+addopts = "-ra --cov=sqlite_guard_mcp --cov-report=term-missing"
 
 [tool.ruff]
 line-length = 100
