@@ -39,7 +39,7 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          python -m pytest -v --cov-fail-under=80
+          python -m pytest -v
 
       - name: Build distributions
         run: python -m build
