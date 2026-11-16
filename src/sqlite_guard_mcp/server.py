@@ -720,6 +720,7 @@ def explain_query(
     )
 
 
+
 def create_server(
     db_path: str | Path,
     *,
@@ -748,7 +749,7 @@ def create_server(
         sql: str,
         params: dict[str, Any] | list[Any] | None = None,
     ) -> str:
-        """Run a read-only SELECT or WITH query with optional bound parameters."""
+        """Run a read-only SELECT or WITH query."""
         result = execute_guarded_query(
             database,
             sql,
@@ -757,5 +758,109 @@ def create_server(
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
         )
+        return json.dumps(result, ensure_ascii=False)
 
-        return json.dumps(re       
+    @server.tool()
+    def list_database_tables() -> str:
+        """List user-created tables and views."""
+        result = list_tables(
+            database,
+            max_rows=max_rows,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def describe_database_table(table_name: str) -> str:
+        """Inspect a table's columns, indexes, and foreign keys."""
+        result = describe_table(database, table_name)
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def explain_read_query(
+        sql: str,
+        params: dict[str, Any] | list[Any] | None = None,
+    ) -> str:
+        """Explain the query plan for a read-only SELECT or WITH query."""
+        result = explain_query(
+            database,
+            sql,
+            params,
+            max_rows=max_rows,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    return server
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the SQLite Guard MCP server over standard input/output."""
+    parser = argparse.ArgumentParser(
+        description="Read-only, security-hardened SQLite MCP server."
+    )
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("SQLITE_GUARD_DB"),
+        help="Path to an existing SQLite database.",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=DEFAULT_MAX_ROWS,
+        help="Maximum rows returned per query.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help="Maximum query execution time in seconds.",
+    )
+    parser.add_argument(
+        "--max-vm-steps",
+        type=int,
+        default=DEFAULT_MAX_VM_STEPS,
+        help="Maximum SQLite virtual-machine steps.",
+    )
+
+    args = parser.parse_args(argv)
+
+    if not args.db:
+        parser.error(
+            "Provide --db or set the SQLITE_GUARD_DB environment variable."
+        )
+
+    if not 1 <= args.max_rows <= MAX_ROWS_HARD_LIMIT:
+        parser.error(
+            f"--max-rows must be between 1 and {MAX_ROWS_HARD_LIMIT}."
+        )
+
+    if not 0.05 <= args.timeout <= 60:
+        parser.error("--timeout must be between 0.05 and 60 seconds.")
+
+    if not 1_000 <= args.max_vm_steps <= 100_000_000:
+        parser.error("--max-vm-steps is outside the permitted range.")
+
+    try:
+        database = Path(args.db).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        parser.error("The configured database path does not exist.")
+
+    if not database.is_file():
+        parser.error("The configured database path is not a regular file.")
+
+    server = create_server(
+        database,
+        max_rows=args.max_rows,
+        timeout_seconds=args.timeout,
+        max_vm_steps=args.max_vm_steps,
+    )
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+    
