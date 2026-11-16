@@ -333,3 +333,169 @@ async def test_official_mcp_client_lists_and_calls_tools(
         assert decoded["ok"] is True
         assert decoded["row_count"] == 2
     
+def test_extended_credential_names_are_masked(
+    database: Path,
+) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE credential_variants (
+                pwd TEXT,
+                "api-key" TEXT,
+                privateKey TEXT,
+                accessToken TEXT,
+                refreshToken TEXT,
+                clientSecret TEXT,
+                passphrase TEXT,
+                credit_card_number TEXT,
+                cvv TEXT,
+                prompt_tokens INTEGER,
+                output_tokens INTEGER
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            INSERT INTO credential_variants VALUES (
+                'p1',
+                'k1',
+                'k2',
+                't1',
+                't2',
+                's1',
+                'p2',
+                '4111111111111111',
+                '123',
+                100,
+                200
+            )
+            """
+        )
+
+    result = execute_guarded_query(
+        database,
+        "SELECT * FROM credential_variants",
+    )
+
+    assert result["ok"] is True
+
+    row = result["rows"][0]
+
+    for name in (
+        "pwd",
+        "api-key",
+        "privateKey",
+        "accessToken",
+        "refreshToken",
+        "clientSecret",
+        "passphrase",
+        "credit_card_number",
+        "cvv",
+    ):
+        assert row[name] is None, name
+
+    assert row["prompt_tokens"] == 100
+    assert row["output_tokens"] == 200
+
+
+def test_sensitive_column_alias_does_not_expose_value(
+    database: Path,
+) -> None:
+    result = execute_guarded_query(
+        database,
+        "SELECT password AS harmless_name FROM people WHERE id = 1",
+    )
+
+    assert result["ok"] is True
+    assert result["rows"][0]["harmless_name"] is None
+
+
+def test_sensitive_values_through_views_remain_masked(
+    database: Path,
+) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE VIEW public_people AS
+            SELECT id, password AS display_value
+            FROM people
+            """
+        )
+
+    result = execute_guarded_query(
+        database,
+        "SELECT display_value FROM public_people WHERE id = 1",
+    )
+
+    assert result["ok"] is True
+    assert result["rows"][0]["display_value"] is None
+
+
+def test_blocked_write_does_not_change_database(
+    database: Path,
+) -> None:
+    result = execute_guarded_query(
+        database,
+        "UPDATE people SET name = 'Changed' WHERE id = 1",
+    )
+
+    assert result["ok"] is False
+
+    with sqlite3.connect(database) as connection:
+        name = connection.execute(
+            "SELECT name FROM people WHERE id = 1"
+        ).fetchone()[0]
+
+    assert name == "Alice"
+
+
+def test_multiple_statement_write_attempt_is_rejected(
+    database: Path,
+) -> None:
+    result = execute_guarded_query(
+        database,
+        "SELECT 1; DELETE FROM people",
+    )
+
+    assert result["ok"] is False
+
+    with sqlite3.connect(database) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM people"
+        ).fetchone()[0]
+
+    assert count == 2
+
+
+def test_parameter_size_limits_are_enforced(
+    database: Path,
+) -> None:
+    oversized_text = execute_guarded_query(
+        database,
+        "SELECT ?",
+        ["x" * 5000],
+    )
+
+    oversized_blob = execute_guarded_query(
+        database,
+        "SELECT ?",
+        [b"x" * 5000],
+    )
+
+    assert oversized_text["code"] == "invalid_input"
+    assert oversized_blob["code"] == "invalid_input"
+
+
+def test_non_finite_query_parameters_are_rejected(
+    database: Path,
+) -> None:
+    for value in (float("nan"), float("inf"), float("-inf")):
+        result = execute_guarded_query(
+            database,
+            "SELECT ?",
+            [value],
+        )
+
+        assert result["ok"] is False
+        assert result["code"] == "invalid_input"
