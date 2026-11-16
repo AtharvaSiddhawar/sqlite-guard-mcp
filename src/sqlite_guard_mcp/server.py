@@ -1,4 +1,3 @@
-
 """Read-only SQLite MCP server with bounded execution and credential masking."""
 
 from __future__ import annotations
@@ -12,8 +11,10 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
+
+from pydantic import Field
 
 from . import __version__
 
@@ -47,6 +48,13 @@ _BLOCKED_FUNCTIONS = frozenset(
         "edit",
         "randomblob",
         "zeroblob",
+        "fsdir",
+        "fileio_read",
+        "fileio_write",
+        "zipfile",
+        "zipfile_cds",
+        "eval",
+        "sqlite_eval",
     }
 )
 
@@ -73,15 +81,23 @@ _NO_ARGUMENT_PRAGMAS = frozenset(
 _SAFE_TOKEN_METRICS = frozenset(
     {
         "prompt_tokens",
+        "prompt_token",
         "completion_tokens",
+        "completion_token",
         "total_tokens",
+        "total_token",
         "input_tokens",
+        "input_token",
         "output_tokens",
+        "output_token",
         "cached_tokens",
+        "cached_token",
+        "reasoning_tokens",
+        "reasoning_token",
     }
 )
 
-_SENSITIVE_PARTS = frozenset(
+_SENSITIVE_WORDS = frozenset(
     {
         "password",
         "passwd",
@@ -89,19 +105,33 @@ _SENSITIVE_PARTS = frozenset(
         "passphrase",
         "secret",
         "credential",
+        "credentials",
         "authorization",
         "cookie",
-        "private_key",
-        "client_secret",
-        "access_key",
-        "api_key",
+        "cookies",
         "apikey",
         "ssn",
+        "cvv",
+        "cvc",
+        "pin",
+        "salt",
+    }
+)
+
+_SENSITIVE_PHRASES = frozenset(
+    {
+        "api_key",
+        "access_key",
+        "auth_key",
+        "private_key",
+        "secret_key",
+        "signing_key",
+        "encryption_key",
+        "session_key",
+        "client_secret",
         "social_security",
         "credit_card",
         "card_number",
-        "cvv",
-        "cvc",
         "tax_id",
         "national_id",
         "bank_account",
@@ -126,11 +156,15 @@ def _is_sensitive_column(name: str | None) -> bool:
         name.strip(),
     )
 
-    normalized = re.sub(
-        r"[^a-zA-Z0-9]+",
-        "_",
-        normalized,
-    ).strip("_").casefold()
+    normalized = (
+        re.sub(
+            r"[^a-zA-Z0-9]+",
+            "_",
+            normalized,
+        )
+        .strip("_")
+        .casefold()
+    )
 
     if normalized in _SAFE_TOKEN_METRICS:
         return False
@@ -140,22 +174,11 @@ def _is_sensitive_column(name: str | None) -> bool:
     if "token" in parts:
         return True
 
-    if parts.intersection(_SENSITIVE_PARTS):
+    if parts.intersection(_SENSITIVE_WORDS):
         return True
 
-    return any(
-        sensitive in normalized
-        for sensitive in (
-            "password",
-            "passwd",
-            "passphrase",
-            "client_secret",
-            "authorization",
-            "private_key",
-            "credential",
-            "social_security",
-        )
-    )
+    padded = f"_{normalized}_"
+    return any(f"_{phrase}_" in padded for phrase in _SENSITIVE_PHRASES)
 
 
 def _authorize(
@@ -208,9 +231,7 @@ def _validate_query(
         raise ValueError("SQL query must be a non-empty string.")
 
     if len(sql) > MAX_SQL_LENGTH:
-        raise ValueError(
-            f"SQL query exceeds the {MAX_SQL_LENGTH}-character limit."
-        )
+        raise ValueError(f"SQL query exceeds the {MAX_SQL_LENGTH}-character limit.")
 
     cleaned = _strip_leading_comments(sql)
 
@@ -218,8 +239,8 @@ def _validate_query(
         raise ValueError("SQL query must be a non-empty string.")
 
     if explain:
-        if not re.match(r"\A(?:SELECT|WITH)\b", cleaned, re.IGNORECASE):
-            raise ValueError("Only SELECT or WITH queries can be explained.")
+        if not re.match(r"\A(?:SELECT|WITH|VALUES)\b", cleaned, re.IGNORECASE):
+            raise ValueError("Only SELECT, WITH, or VALUES queries can be explained.")
         return f"EXPLAIN QUERY PLAN {cleaned}"
 
     match = _FIRST_WORD.match(cleaned)
@@ -229,7 +250,7 @@ def _validate_query(
 
     first = match.group(1).upper()
 
-    if first in {"SELECT", "WITH"}:
+    if first in {"SELECT", "WITH", "VALUES"}:
         return sql.strip()
 
     if first == "EXPLAIN" and allow_explain_plan:
@@ -238,16 +259,15 @@ def _validate_query(
         if explain_match is None:
             raise ValueError("Only EXPLAIN QUERY PLAN is permitted.")
 
-        explained = cleaned[explain_match.end():].lstrip()
+        explained = cleaned[explain_match.end() :].lstrip()
         explained_match = _FIRST_WORD.match(explained)
 
-        if (
-            not explained_match
-            or explained_match.group(1).upper() not in {"SELECT", "WITH"}
-        ):
-            raise ValueError(
-                "EXPLAIN QUERY PLAN must contain a SELECT or WITH query."
-            )
+        if not explained_match or explained_match.group(1).upper() not in {
+            "SELECT",
+            "WITH",
+            "VALUES",
+        }:
+            raise ValueError("EXPLAIN QUERY PLAN must contain a SELECT or WITH query.")
 
         return sql.strip()
 
@@ -262,9 +282,7 @@ def _validate_params(
         return ()
 
     if not isinstance(params, (dict, list, tuple)):
-        raise ValueError(
-            "Query parameters must be an object, array, or null."
-        )
+        raise ValueError("Query parameters must be an object, array, or null.")
 
     if isinstance(params, dict):
         if not all(isinstance(key, str) for key in params):
@@ -276,28 +294,20 @@ def _validate_params(
     for value in values:
         if value is None or isinstance(value, (str, int, float, bytes)):
             if isinstance(value, float) and not math.isfinite(value):
-                raise ValueError(
-                    "Floating-point query parameters must be finite."
-                )
+                raise ValueError("Floating-point query parameters must be finite.")
 
             if isinstance(value, str) and len(value) > MAX_CELL_TEXT:
-                raise ValueError(
-                    "A query parameter exceeds the maximum text length."
-                )
+                raise ValueError("A query parameter exceeds the maximum text length.")
 
             if isinstance(value, bytes) and len(value) > MAX_BLOB_BYTES:
-                raise ValueError(
-                    "A BLOB query parameter exceeds the maximum byte length."
-                )
+                raise ValueError("A BLOB query parameter exceeds the maximum byte length.")
 
             continue
 
         if isinstance(value, bool):
             continue
 
-        raise ValueError(
-            "Query parameters must contain only SQLite scalar values."
-        )
+        raise ValueError("Query parameters must contain only SQLite scalar values.")
 
     return params
 
@@ -312,9 +322,7 @@ def _open_connection(
     path = Path(db_path).expanduser().resolve(strict=True)
 
     if not path.is_file():
-        raise FileNotFoundError(
-            "Database path is not a regular file."
-        )
+        raise FileNotFoundError("Database path is not a regular file.")
 
     encoded_path = quote(path.as_posix(), safe="/:\\")
 
@@ -354,9 +362,7 @@ def _open_connection(
             nonlocal vm_calls
             vm_calls += 1
 
-            time_exceeded = (
-                time.monotonic() - started > timeout_seconds
-            )
+            time_exceeded = time.monotonic() - started > timeout_seconds
             steps_exceeded = vm_calls * vm_interval >= max_vm_steps
 
             return int(time_exceeded or steps_exceeded)
@@ -423,18 +429,12 @@ def _bounded_result(
     """Build a response within the configured column and byte limits."""
     original_columns = columns[:MAX_COLUMNS]
     limited_columns = [name[:256] for name in original_columns]
-    column_names = dict(
-        zip(original_columns, limited_columns, strict=False)
-    )
+    column_names = dict(zip(original_columns, limited_columns, strict=False))
 
     columns_truncated = len(columns) > MAX_COLUMNS
 
     safe_rows = [
-        {
-            column_names[key]: _json_safe(value)
-            for key, value in row.items()
-            if key in column_names
-        }
+        {column_names[key]: _json_safe(value) for key, value in row.items() if key in column_names}
         for row in rows
     ]
 
@@ -458,9 +458,7 @@ def _bounded_result(
         payload["row_count"] = 0
         payload["truncated"] = True
         payload["columns_truncated"] = True
-        payload["warning"] = (
-            "The result exceeded the maximum response size and was omitted."
-        )
+        payload["warning"] = "The result exceeded the maximum response size and was omitted."
 
     return payload
 
@@ -532,15 +530,9 @@ def execute_guarded_query(
         was_truncated = len(fetched) > max_rows
         selected = fetched[:max_rows]
 
-        columns = [
-            item[0]
-            for item in (cursor.description or [])
-        ]
+        columns = [item[0] for item in (cursor.description or [])]
 
-        rows = [
-            dict(row)
-            for row in selected
-        ]
+        rows = [dict(row) for row in selected]
 
         elapsed = round(
             (time.perf_counter() - started) * 1000,
@@ -570,13 +562,25 @@ def execute_guarded_query(
             )
 
         return _error(
-            "SQLite could not execute this query.",
+            f"SQLite could not execute this query: {exc}",
             "query_failed",
         )
 
-    except sqlite3.Error:
+    except sqlite3.ProgrammingError as exc:
+        reason = str(exc).casefold()
+        if "one statement" in reason:
+            return _error(
+                "Only a single SQL statement can be executed at a time.",
+                "invalid_input",
+            )
         return _error(
-            "SQLite could not execute this query.",
+            f"SQLite parameter error: {exc}",
+            "invalid_input",
+        )
+
+    except sqlite3.Error as exc:
+        return _error(
+            f"SQLite could not execute this query: {exc}",
             "query_failed",
         )
 
@@ -613,9 +617,7 @@ def _quote_identifier(identifier: str) -> str:
         or len(identifier) > 256
         or "\x00" in identifier
     ):
-        raise ValueError(
-            "Table name must contain 1–256 non-NUL characters."
-        )
+        raise ValueError("Table name must contain 1–256 non-NUL characters.")
 
     return '"' + identifier.replace('"', '""') + '"'
 
@@ -623,6 +625,9 @@ def _quote_identifier(identifier: str) -> str:
 def describe_table(
     db_path: str | Path,
     table_name: str,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
 ) -> dict[str, Any]:
     """Return table columns, indexes, foreign keys, and masking metadata."""
     try:
@@ -632,7 +637,11 @@ def describe_table(
         return _error(str(exc), "invalid_table_name")
 
     try:
-        connection = _open_connection(db_path)
+        connection = _open_connection(
+            db_path,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
 
     except FileNotFoundError:
         return _error(
@@ -647,12 +656,9 @@ def describe_table(
         )
 
     try:
-        columns = [
-            dict(row)
-            for row in connection.execute(
-                f"PRAGMA table_xinfo({quoted_table})"
-            )
-        ][:MAX_COLUMNS]
+        columns = [dict(row) for row in connection.execute(f"PRAGMA table_xinfo({quoted_table})")][
+            :MAX_COLUMNS
+        ]
 
         if not columns:
             return _error(
@@ -661,38 +667,27 @@ def describe_table(
             )
 
         for column in columns:
-            column["masked_by_guard"] = _is_sensitive_column(
-                str(column.get("name", ""))
-            )
+            column["masked_by_guard"] = _is_sensitive_column(str(column.get("name", "")))
 
         indexes = []
 
-        index_rows = list(
-            connection.execute(
-                f"PRAGMA index_list({quoted_table})"
-            )
-        )[:MAX_COLUMNS]
+        index_rows = list(connection.execute(f"PRAGMA index_list({quoted_table})"))[:MAX_COLUMNS]
 
         for index in index_rows:
             item = dict(index)
             quoted_index = _quote_identifier(str(item["name"]))
 
             item["columns"] = [
-                dict(row)
-                for row in connection.execute(
-                    f"PRAGMA index_xinfo({quoted_index})"
-                )
+                dict(row) for row in connection.execute(f"PRAGMA index_xinfo({quoted_index})")
             ]
 
             indexes.append(item)
 
         foreign_keys = [
             dict(row)
-            for row in list(
-                connection.execute(
-                    f"PRAGMA foreign_key_list({quoted_table})"
-                )
-            )[:MAX_COLUMNS]
+            for row in list(connection.execute(f"PRAGMA foreign_key_list({quoted_table})"))[
+                :MAX_COLUMNS
+            ]
         ]
 
         return {
@@ -740,7 +735,6 @@ def explain_query(
     )
 
 
-
 def create_server(
     db_path: str | Path,
     *,
@@ -748,7 +742,7 @@ def create_server(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
 ) -> Any:
-    """Create the official MCP SDK server with four SQLite Guard tools."""
+    """Create the official MCP SDK server with SQLite Guard tools and schema resources."""
     from mcp.server.mcpserver import MCPServer
 
     database = Path(db_path).expanduser()
@@ -766,10 +760,22 @@ def create_server(
 
     @server.tool()
     def read_query(
-        sql: str,
-        params: dict[str, Any] | list[Any] | None = None,
+        sql: Annotated[
+            str,
+            Field(description="Read-only SELECT, WITH, or VALUES SQL query to execute."),
+        ],
+        params: Annotated[
+            dict[str, Any] | list[Any] | None,
+            Field(
+                default=None,
+                description=(
+                    "Optional query parameters as a list for positional ? placeholders, "
+                    "or dict for named (:name, $name) placeholders."
+                ),
+            ),
+        ] = None,
     ) -> str:
-        """Run a read-only SELECT or WITH query."""
+        """Run a read-only SELECT, WITH, or VALUES query with bound parameters."""
         result = execute_guarded_query(
             database,
             sql,
@@ -782,7 +788,7 @@ def create_server(
 
     @server.tool()
     def list_database_tables() -> str:
-        """List user-created tables and views."""
+        """List user-created tables and views in the database."""
         result = list_tables(
             database,
             max_rows=max_rows,
@@ -792,17 +798,39 @@ def create_server(
         return json.dumps(result, ensure_ascii=False)
 
     @server.tool()
-    def describe_database_table(table_name: str) -> str:
-        """Inspect a table's columns, indexes, and foreign keys."""
-        result = describe_table(database, table_name)
+    def describe_database_table(
+        table_name: Annotated[
+            str,
+            Field(description="The name of the database table or view to inspect."),
+        ],
+    ) -> str:
+        """Inspect a table's schema, indexes, foreign keys, and masking metadata."""
+        result = describe_table(
+            database,
+            table_name,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
         return json.dumps(result, ensure_ascii=False)
 
     @server.tool()
     def explain_read_query(
-        sql: str,
-        params: dict[str, Any] | list[Any] | None = None,
+        sql: Annotated[
+            str,
+            Field(description="Read-only SELECT, WITH, or VALUES SQL query to explain."),
+        ],
+        params: Annotated[
+            dict[str, Any] | list[Any] | None,
+            Field(
+                default=None,
+                description=(
+                    "Optional query parameters as a list for positional ? placeholders, "
+                    "or dict for named placeholders."
+                ),
+            ),
+        ] = None,
     ) -> str:
-        """Explain the query plan for a read-only SELECT or WITH query."""
+        """Explain the query plan (EXPLAIN QUERY PLAN) for a read-only query."""
         result = explain_query(
             database,
             sql,
@@ -813,13 +841,57 @@ def create_server(
         )
         return json.dumps(result, ensure_ascii=False)
 
+    @server.resource("schema://summary")
+    def database_schema_summary() -> str:
+        """Provide a summary of all user-created tables, views, and column definitions."""
+        tables_res = list_tables(
+            database,
+            max_rows=MAX_ROWS_HARD_LIMIT,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+        if not tables_res.get("ok"):
+            return json.dumps(tables_res, ensure_ascii=False)
+
+        summary: dict[str, Any] = {"tables": {}}
+        for row in tables_res.get("rows", []):
+            name = row.get("name")
+            if name:
+                table_info = describe_table(
+                    database,
+                    name,
+                    timeout_seconds=timeout_seconds,
+                    max_vm_steps=max_vm_steps,
+                )
+                if table_info.get("ok"):
+                    summary["tables"][name] = {
+                        "type": row.get("type"),
+                        "columns": [
+                            {
+                                "name": col.get("name"),
+                                "type": col.get("type"),
+                                "pk": bool(col.get("pk")),
+                                "masked": col.get("masked_by_guard", False),
+                            }
+                            for col in table_info.get("columns", [])
+                        ],
+                    }
+        return json.dumps(summary, ensure_ascii=False)
+
     return server
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the SQLite Guard MCP server over standard input/output."""
     parser = argparse.ArgumentParser(
-        description="Read-only, security-hardened SQLite MCP server."
+        prog="sqlite-guard-mcp",
+        description="Read-only, security-hardened SQLite MCP server.",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--db",
@@ -844,18 +916,20 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_VM_STEPS,
         help="Maximum SQLite virtual-machine steps.",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+        help="MCP transport to run (default: stdio).",
+    )
 
     args = parser.parse_args(argv)
 
     if not args.db:
-        parser.error(
-            "Provide --db or set the SQLITE_GUARD_DB environment variable."
-        )
+        parser.error("Provide --db or set the SQLITE_GUARD_DB environment variable.")
 
     if not 1 <= args.max_rows <= MAX_ROWS_HARD_LIMIT:
-        parser.error(
-            f"--max-rows must be between 1 and {MAX_ROWS_HARD_LIMIT}."
-        )
+        parser.error(f"--max-rows must be between 1 and {MAX_ROWS_HARD_LIMIT}.")
 
     if not 0.05 <= args.timeout <= 60:
         parser.error("--timeout must be between 0.05 and 60 seconds.")
@@ -877,10 +951,12 @@ def main(argv: list[str] | None = None) -> int:
         timeout_seconds=args.timeout,
         max_vm_steps=args.max_vm_steps,
     )
-    server.run()
+    try:
+        server.run(transport=args.transport)
+    except (KeyboardInterrupt, EOFError):
+        pass
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    
