@@ -12,7 +12,6 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import quote
 
 from pydantic import Field
 
@@ -324,10 +323,8 @@ def _open_connection(
     if not path.is_file():
         raise FileNotFoundError("Database path is not a regular file.")
 
-    encoded_path = quote(path.as_posix(), safe="/:\\")
-
     connection = sqlite3.connect(
-        f"file:{encoded_path}?mode=ro",
+        f"{path.as_uri()}?mode=ro",
         uri=True,
         timeout=timeout_seconds,
         isolation_level=None,
