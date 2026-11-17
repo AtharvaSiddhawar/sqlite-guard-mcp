@@ -16,8 +16,13 @@ A read-only, security-hardened [Model Context Protocol](https://modelcontextprot
 - MCP Resource support: `schema://summary` provides zero-turn inspection of tables and schemas.
 - Rich parameter schemas with docstrings and descriptions for LLM agents.
 - SQLite authorizer strictly denies write operations, database attachments, dangerous functions (`load_extension`, `readfile`, `writefile`, `fsdir`, `eval`, etc.), and unapproved PRAGMAs.
+- Database path introspection is blocked: `PRAGMA database_list` and `pragma_database_list` table-valued queries are denied at the authorizer boundary.
+- Schema DDL definitions in `sqlite_schema` / `sqlite_master` have their `sql` column masked as `NULL` to prevent secret leakage through `CREATE TABLE` defaults and check constraints.
 - Sensitive credential columns (`password`, `api_key`, `access_key`, `secret`, `private_key`, `credit_card`, etc.) are masked as `NULL` at SQLite's authorizer boundary.
+- Sensitive default values in table metadata (`describe_database_table` and `schema://summary`) are redacted (`default_redacted: true`, `dflt_value: null`) while safe defaults are preserved.
 - Usage token metrics (`prompt_tokens`, `completion_tokens`, `total_tokens`, etc.) are explicitly preserved.
+- Reliable connection and cursor lifecycles guarantee all SQLite handles are closed promptly on success and failure without resource leaks.
+- Error messages sanitize local filesystem paths and URIs to prevent host environment disclosure.
 - Hard resource bounds: query timeout, SQLite VM-step budget, row cap, column cap, text cell length cap, and total response byte size cap.
 - BLOB values are returned as bounded Base64 previews rather than raw byte dumps.
 

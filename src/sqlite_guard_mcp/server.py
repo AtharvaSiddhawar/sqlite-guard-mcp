@@ -70,10 +70,18 @@ _TABLE_PRAGMAS = frozenset(
 
 _NO_ARGUMENT_PRAGMAS = frozenset(
     {
-        "database_list",
         "compile_options",
         "encoding",
         "data_version",
+    }
+)
+
+_SCHEMA_TABLES = frozenset(
+    {
+        "sqlite_schema",
+        "sqlite_master",
+        "sqlite_temp_schema",
+        "sqlite_temp_master",
     }
 )
 
@@ -195,6 +203,21 @@ def _authorize(
         return sqlite3.SQLITE_OK
 
     if action == sqlite3.SQLITE_READ:
+        table_name = (arg1 or "").casefold()
+        column_name = (arg2 or "").casefold()
+
+        if table_name == "pragma_database_list":
+            return sqlite3.SQLITE_DENY
+
+        if table_name in _SCHEMA_TABLES and column_name == "sql":
+            return sqlite3.SQLITE_IGNORE
+
+        if (
+            table_name in {"pragma_table_info", "pragma_table_xinfo"}
+            and column_name == "dflt_value"
+        ):
+            return sqlite3.SQLITE_IGNORE
+
         if _is_sensitive_column(arg2):
             return sqlite3.SQLITE_IGNORE
         return sqlite3.SQLITE_OK
@@ -207,6 +230,9 @@ def _authorize(
 
     if action == sqlite3.SQLITE_PRAGMA:
         pragma = (arg1 or "").casefold()
+
+        if pragma == "database_list":
+            return sqlite3.SQLITE_DENY
 
         if pragma in _TABLE_PRAGMAS:
             return sqlite3.SQLITE_OK
@@ -397,11 +423,21 @@ def _json_safe(value: Any) -> Any:
     return str(value)[:MAX_CELL_TEXT]
 
 
+_PATH_PATTERN = re.compile(
+    r"(?:[A-Za-z]:\\[^\s:;,()]+|/(?:home|usr|var|tmp|etc|opt|private|Users|mnt|c|d|e)/[^\s:;,()]+|file://[^\s:;,()]+)",
+)
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Strip local filesystem paths and file URIs from error messages."""
+    return _PATH_PATTERN.sub("<path>", message)
+
+
 def _error(message: str, code: str) -> dict[str, Any]:
     """Build a consistent, non-sensitive error response."""
     return {
         "ok": False,
-        "error": message,
+        "error": _sanitize_error_message(message),
         "code": code,
     }
 
@@ -519,6 +555,7 @@ def execute_guarded_query(
         )
 
     started = time.perf_counter()
+    cursor = None
 
     try:
         cursor = connection.execute(statement, bindings)
@@ -543,7 +580,7 @@ def execute_guarded_query(
             elapsed,
         )
 
-    except sqlite3.OperationalError as exc:
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
         reason = str(exc).casefold()
 
         if "not authorized" in reason or "prohibited" in reason:
@@ -582,6 +619,8 @@ def execute_guarded_query(
         )
 
     finally:
+        if cursor is not None:
+            cursor.close()
         connection.close()
 
 
@@ -653,9 +692,16 @@ def describe_table(
         )
 
     try:
-        columns = [dict(row) for row in connection.execute(f"PRAGMA table_xinfo({quoted_table})")][
-            :MAX_COLUMNS
-        ]
+
+        def _fetch_rows(query: str) -> list[sqlite3.Row]:
+            cur = connection.execute(query)
+            try:
+                return cur.fetchall()
+            finally:
+                cur.close()
+
+        raw_columns = _fetch_rows(f"PRAGMA table_xinfo({quoted_table})")[:MAX_COLUMNS]
+        columns = [dict(row) for row in raw_columns]
 
         if not columns:
             return _error(
@@ -664,27 +710,32 @@ def describe_table(
             )
 
         for column in columns:
-            column["masked_by_guard"] = _is_sensitive_column(str(column.get("name", "")))
+            col_name = str(column.get("name", ""))
+            is_sensitive = _is_sensitive_column(col_name)
+            column["masked_by_guard"] = is_sensitive
+            if is_sensitive:
+                column["default_redacted"] = column.get("dflt_value") is not None
+                column["dflt_value"] = None
+            else:
+                column["default_redacted"] = False
 
         indexes = []
 
-        index_rows = list(connection.execute(f"PRAGMA index_list({quoted_table})"))[:MAX_COLUMNS]
+        raw_indexes = _fetch_rows(f"PRAGMA index_list({quoted_table})")[:MAX_COLUMNS]
 
-        for index in index_rows:
+        for index in raw_indexes:
             item = dict(index)
             quoted_index = _quote_identifier(str(item["name"]))
 
             item["columns"] = [
-                dict(row) for row in connection.execute(f"PRAGMA index_xinfo({quoted_index})")
+                dict(row) for row in _fetch_rows(f"PRAGMA index_xinfo({quoted_index})")
             ]
 
             indexes.append(item)
 
         foreign_keys = [
             dict(row)
-            for row in list(connection.execute(f"PRAGMA foreign_key_list({quoted_table})"))[
-                :MAX_COLUMNS
-            ]
+            for row in _fetch_rows(f"PRAGMA foreign_key_list({quoted_table})")[:MAX_COLUMNS]
         ]
 
         return {
@@ -869,6 +920,7 @@ def create_server(
                                 "type": col.get("type"),
                                 "pk": bool(col.get("pk")),
                                 "masked": col.get("masked_by_guard", False),
+                                "default_redacted": col.get("default_redacted", False),
                             }
                             for col in table_info.get("columns", [])
                         ],

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,16 @@ from sqlite_guard_mcp.server import (
 )
 
 
+@contextlib.contextmanager
+def open_test_connection(path: Path | str) -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(path)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -26,7 +38,7 @@ def anyio_backend() -> str:
 def database(tmp_path: Path) -> Path:
     path = tmp_path / "sample database.sqlite"
 
-    with sqlite3.connect(path) as connection:
+    with open_test_connection(path) as connection:
         connection.executescript(
             """
             CREATE TABLE people (
@@ -82,7 +94,7 @@ def test_read_masks_secrets_and_preserves_token_metrics(
 def test_camel_case_secret_names_are_masked(
     database: Path,
 ) -> None:
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         connection.execute("ALTER TABLE people ADD COLUMN apiToken TEXT")
         connection.execute("ALTER TABLE people ADD COLUMN promptTokens INTEGER")
         connection.execute("UPDATE people SET apiToken='secret-value', promptTokens=77")
@@ -233,7 +245,7 @@ def test_schema_and_table_listing(
 def test_table_names_with_quotes_are_safely_escaped(
     database: Path,
 ) -> None:
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         connection.execute('CREATE TABLE "odd name" ("select" TEXT)')
 
     result = describe_table(database, "odd name")
@@ -257,7 +269,7 @@ def test_nonexistent_database_returns_safe_error(
 def test_output_is_json_bounded(
     database: Path,
 ) -> None:
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         connection.execute(
             "INSERT INTO people VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
@@ -321,7 +333,7 @@ async def test_official_mcp_client_lists_and_calls_tools(
 def test_extended_credential_names_are_masked(
     database: Path,
 ) -> None:
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         connection.execute(
             """
             CREATE TABLE credential_variants (
@@ -399,7 +411,7 @@ def test_sensitive_column_alias_does_not_expose_value(
 def test_sensitive_values_through_views_remain_masked(
     database: Path,
 ) -> None:
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         connection.execute(
             """
             CREATE VIEW public_people AS
@@ -427,7 +439,7 @@ def test_blocked_write_does_not_change_database(
 
     assert result["ok"] is False
 
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         name = connection.execute("SELECT name FROM people WHERE id = 1").fetchone()[0]
 
     assert name == "Alice"
@@ -443,7 +455,7 @@ def test_multiple_statement_write_attempt_is_rejected(
 
     assert result["ok"] is False
 
-    with sqlite3.connect(database) as connection:
+    with open_test_connection(database) as connection:
         count = connection.execute("SELECT COUNT(*) FROM people").fetchone()[0]
 
     assert count == 2
@@ -609,7 +621,7 @@ def test_database_corrupt_or_open_failed(tmp_path: Path, monkeypatch: pytest.Mon
 
 def test_result_size_truncation_warning(database: Path) -> None:
     # Test result truncation where columns or rows exceed MAX_RESULT_BYTES
-    with sqlite3.connect(database) as conn:
+    with open_test_connection(database) as conn:
         conn.execute("CREATE TABLE huge (data TEXT)")
         for _ in range(30):
             conn.execute("INSERT INTO huge VALUES (?)", ("y" * 4000,))
@@ -741,9 +753,33 @@ def test_main_module_help(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_authorizer_direct() -> None:
     from sqlite_guard_mcp.server import _authorize
 
-    assert _authorize(sqlite3.SQLITE_PRAGMA, "database_list", None, None, None) == sqlite3.SQLITE_OK
+    assert (
+        _authorize(sqlite3.SQLITE_PRAGMA, "database_list", None, None, None) == sqlite3.SQLITE_DENY
+    )
     assert (
         _authorize(sqlite3.SQLITE_PRAGMA, "database_list", "arg", None, None) == sqlite3.SQLITE_DENY
+    )
+    assert (
+        _authorize(sqlite3.SQLITE_READ, "pragma_database_list", "seq", None, None)
+        == sqlite3.SQLITE_DENY
+    )
+    assert (
+        _authorize(sqlite3.SQLITE_READ, "sqlite_schema", "sql", None, None) == sqlite3.SQLITE_IGNORE
+    )
+    assert (
+        _authorize(sqlite3.SQLITE_READ, "sqlite_master", "sql", None, None) == sqlite3.SQLITE_IGNORE
+    )
+    assert (
+        _authorize(sqlite3.SQLITE_READ, "sqlite_temp_schema", "sql", None, None)
+        == sqlite3.SQLITE_IGNORE
+    )
+    assert (
+        _authorize(sqlite3.SQLITE_READ, "sqlite_temp_master", "sql", None, None)
+        == sqlite3.SQLITE_IGNORE
+    )
+    assert (
+        _authorize(sqlite3.SQLITE_READ, "pragma_table_info", "dflt_value", None, None)
+        == sqlite3.SQLITE_IGNORE
     )
     assert _authorize(sqlite3.SQLITE_PRAGMA, "table_info", "tbl", None, None) == sqlite3.SQLITE_OK
     assert (
@@ -797,3 +833,149 @@ def test_describe_table_schema_inspection_failed(
     res = describe_table(database, "people")
     assert res["ok"] is False
     assert res["code"] == "schema_inspection_failed"
+
+
+def test_pragma_database_list_is_blocked(database: Path) -> None:
+    res1 = execute_guarded_query(database, "PRAGMA database_list")
+    assert res1["ok"] is False
+    assert res1["code"] == "invalid_input"
+
+    res2 = execute_guarded_query(database, "SELECT * FROM pragma_database_list")
+    assert res2["ok"] is False
+    assert res2["code"] == "blocked_operation"
+
+    res3 = execute_guarded_query(database, "SELECT * FROM pragma_database_list()")
+    assert res3["ok"] is False
+    assert res3["code"] == "blocked_operation"
+
+
+def test_schema_sql_definitions_are_masked(database: Path) -> None:
+    res1 = execute_guarded_query(database, "SELECT name, sql FROM sqlite_schema")
+    assert res1["ok"] is True
+    assert res1["row_count"] > 0
+    for row in res1["rows"]:
+        assert row["sql"] is None
+
+    res2 = execute_guarded_query(database, "SELECT name, sql FROM sqlite_master")
+    assert res2["ok"] is True
+    assert res2["row_count"] > 0
+    for row in res2["rows"]:
+        assert row["sql"] is None
+
+    res3 = execute_guarded_query(
+        database,
+        "SELECT * FROM sqlite_master WHERE sql LIKE '%CREATE%'",
+    )
+    assert res3["ok"] is True
+    assert res3["row_count"] == 0
+
+
+def test_sensitive_default_values_are_redacted(database: Path) -> None:
+    with open_test_connection(database) as conn:
+        conn.execute(
+            """
+            CREATE TABLE app_config (
+                id INTEGER PRIMARY KEY,
+                service_name TEXT DEFAULT 'auth_svc',
+                client_secret TEXT DEFAULT 'super_secret_shh_123',
+                api_key TEXT DEFAULT 'api_live_abc',
+                max_retries INTEGER DEFAULT 5
+            )
+            """
+        )
+
+    desc = describe_table(database, "app_config")
+    assert desc["ok"] is True
+
+    col_map = {c["name"]: c for c in desc["columns"]}
+
+    assert col_map["service_name"]["masked_by_guard"] is False
+    assert col_map["service_name"]["default_redacted"] is False
+    assert col_map["service_name"]["dflt_value"] == "'auth_svc'"
+
+    assert col_map["max_retries"]["masked_by_guard"] is False
+    assert col_map["max_retries"]["default_redacted"] is False
+    assert col_map["max_retries"]["dflt_value"] == "5"
+
+    assert col_map["client_secret"]["masked_by_guard"] is True
+    assert col_map["client_secret"]["default_redacted"] is True
+    assert col_map["client_secret"]["dflt_value"] is None
+
+    assert col_map["api_key"]["masked_by_guard"] is True
+    assert col_map["api_key"]["default_redacted"] is True
+    assert col_map["api_key"]["dflt_value"] is None
+
+    # Verify table-valued pragma_table_info masks dflt_value
+    pragma_res = execute_guarded_query(
+        database,
+        "SELECT name, dflt_value FROM pragma_table_info('app_config')",
+    )
+    assert pragma_res["ok"] is True
+    for row in pragma_res["rows"]:
+        assert row["dflt_value"] is None
+
+
+@pytest.mark.anyio
+async def test_schema_summary_resource_redacts_sensitive_defaults(database: Path) -> None:
+    from mcp import Client
+
+    with open_test_connection(database) as conn:
+        conn.execute(
+            """
+            CREATE TABLE auth_settings (
+                id INTEGER PRIMARY KEY,
+                provider TEXT DEFAULT 'google',
+                signing_key TEXT DEFAULT 'k_private_999'
+            )
+            """
+        )
+
+    server = create_server(database)
+    async with Client(server, raise_exceptions=True) as client:
+        res = await client.read_resource("schema://summary")
+        summary = json.loads(res.contents[0].text)
+
+        auth_cols = {c["name"]: c for c in summary["tables"]["auth_settings"]["columns"]}
+        assert auth_cols["provider"]["masked"] is False
+        assert auth_cols["provider"]["default_redacted"] is False
+
+        assert auth_cols["signing_key"]["masked"] is True
+        assert auth_cols["signing_key"]["default_redacted"] is True
+
+
+def test_error_messages_do_not_leak_filesystem_paths(tmp_path: Path) -> None:
+    fake_path = tmp_path / "deep" / "nested" / "missing.sqlite"
+    res1 = execute_guarded_query(fake_path, "SELECT 1")
+    assert res1["ok"] is False
+    assert str(fake_path) not in res1["error"]
+    assert str(tmp_path) not in res1["error"]
+
+    res2 = execute_guarded_query(tmp_path, "SELECT 1")
+    assert res2["ok"] is False
+    assert str(tmp_path) not in res2["error"]
+
+    corrupt = tmp_path / "corrupt_page.sqlite"
+    corrupt.write_text("corrupted content not valid")
+    res3 = execute_guarded_query(corrupt, "SELECT * FROM sqlite_schema")
+    assert res3["ok"] is False
+    assert str(corrupt) not in res3["error"]
+
+
+def test_connection_and_cursor_lifecycle(database: Path) -> None:
+    # Verify connection closure on success
+    res_ok = execute_guarded_query(database, "SELECT 1")
+    assert res_ok["ok"] is True
+
+    # Verify connection closure on authorizer block
+    res_block = execute_guarded_query(database, "PRAGMA database_list")
+    assert res_block["ok"] is False
+
+    # Verify connection closure on query error
+    res_err = execute_guarded_query(database, "SELECT * FROM nonexistent_table")
+    assert res_err["ok"] is False
+
+    # Verify connection closure on describe_table success and error
+    desc_ok = describe_table(database, "people")
+    assert desc_ok["ok"] is True
+    desc_err = describe_table(database, "nonexistent")
+    assert desc_err["ok"] is False
