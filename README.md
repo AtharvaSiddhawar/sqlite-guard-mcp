@@ -11,19 +11,25 @@ A read-only, security-hardened [Model Context Protocol](https://modelcontextprot
 ## Features
 
 - Standard MCP transports (`stdio`, `sse`, and `streamable-http`) through the official MCP Python SDK.
-- Read-only `SELECT`, `WITH`, and `VALUES` queries with bound parameters.
-- Built-in schema inspection: separate tools for listing tables, describing schemas, and explaining query plans.
+- HTTP / SSE Bearer Token Authentication via `BearerAuthMiddleware` (`--auth-token` or `SQLITE_GUARD_AUTH_TOKEN`).
+- Read-only `SELECT`, `WITH`, and `VALUES` queries with strictly validated bound parameters.
+- Built-in schema inspection & database intelligence:
+  - `list_database_tables`: List tables and views.
+  - `describe_database_table`: Detailed schema inspection with unindexed foreign keys and overlapping index diagnostics.
+  - `explain_read_query`: Query plan diagnostics with structured observations and confidence metrics.
+  - `get_database_overview`: High-level metrics (page count, schema version, table/index/view counts, approximate size).
+  - `search_database_schema`: Bounded case-insensitive search across tables, views, columns, and indexes.
+  - `check_database_health`: Quick integrity check, foreign key violation diagnostics, and index redundancy analysis.
 - MCP Resource support: `schema://summary` provides zero-turn inspection of tables and schemas.
-- Rich parameter schemas with docstrings and descriptions for LLM agents.
-- SQLite authorizer strictly denies write operations, database attachments, dangerous functions (`load_extension`, `readfile`, `writefile`, `fsdir`, `eval`, etc.), and unapproved PRAGMAs.
+- Granular Access Policy Engine (`--policy` / `SQLITE_GUARD_POLICY`): Fail-closed TOML access rules for table/column allow & deny lists, custom sensitive column masking, and feature toggles.
+- Tamper-evident Audit Logging (`--audit-log` / `SQLITE_GUARD_AUDIT_LOG`): Structured JSON Lines logging with SHA-256 query fingerprinting and privacy-safe metadata.
+- Native SQLite authorizer strictly denies write operations, database attachments, dangerous functions (`load_extension`, `readfile`, `writefile`, `fsdir`, `eval`, etc.), and unapproved PRAGMAs.
 - Database path introspection is blocked: `PRAGMA database_list` and `pragma_database_list` table-valued queries are denied at the authorizer boundary.
 - Schema DDL definitions in `sqlite_schema` / `sqlite_master` have their `sql` column masked as `NULL` to prevent secret leakage through `CREATE TABLE` defaults and check constraints.
 - Sensitive credential columns (`password`, `api_key`, `access_key`, `secret`, `private_key`, `credit_card`, etc.) are masked as `NULL` at SQLite's authorizer boundary.
 - Sensitive default values in table metadata (`describe_database_table` and `schema://summary`) are redacted (`default_redacted: true`, `dflt_value: null`) while safe defaults are preserved.
 - Usage token metrics (`prompt_tokens`, `completion_tokens`, `total_tokens`, etc.) are explicitly preserved.
-- Reliable connection and cursor lifecycles guarantee all SQLite handles are closed promptly on success and failure without resource leaks.
-- Error messages sanitize local filesystem paths and URIs to prevent host environment disclosure.
-- Hard resource bounds: query timeout, SQLite VM-step budget, row cap, column cap, text cell length cap, and total response byte size cap.
+- Hard resource bounds: query timeout, SQLite VM-step budget, row cap, column cap, text cell length cap, aggregate parameter byte/count caps, and total response byte size cap.
 - BLOB values are returned as bounded Base64 previews rather than raw byte dumps.
 
 ## Requirements
@@ -56,30 +62,50 @@ python -m build
 sqlite-guard-mcp --db "/absolute/path/to/database.sqlite"
 ```
 
-Optional limits and transport flags:
+Optional limits, policy, audit, and transport flags:
 
 ```bash
-sqlite-guard-mcp --db "/path/to/database.sqlite" --max-rows 250 --timeout 2.0 --max-vm-steps 250000 --transport stdio
+sqlite-guard-mcp --db "/path/to/database.sqlite" \
+  --max-rows 250 \
+  --timeout 2.0 \
+  --max-vm-steps 250000 \
+  --policy "/path/to/policy.toml" \
+  --audit-log "/path/to/audit.jsonl" \
+  --transport streamable-http \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --auth-token "your-bearer-secret"
 ```
 
-You can also set `SQLITE_GUARD_DB` and omit `--db`. Check version with `sqlite-guard-mcp --version`.
+You can also set environment variables:
+- `SQLITE_GUARD_DB`: Path to database file.
+- `SQLITE_GUARD_POLICY`: Path to TOML policy file.
+- `SQLITE_GUARD_AUDIT_LOG`: Path to JSONL audit log file.
+- `SQLITE_GUARD_AUTH_TOKEN`: Bearer token for HTTP/SSE transports.
 
-## MCP client configuration
+Check version with `sqlite-guard-mcp --version`.
 
-Example Claude Desktop-style configuration (adjust the Python executable and database path for your computer):
+## Access Policy (TOML)
 
-```json
-{
-  "mcpServers": {
-    "sqlite-guard": {
-      "command": "sqlite-guard-mcp",
-      "args": ["--db", "/absolute/path/to/database.sqlite"]
-    }
-  }
-}
+Fine-grained access control can be specified in a TOML policy file:
+
+```toml
+[tables]
+allow = ["customers", "orders", "products"]
+deny = ["admin_users", "internal_migrations"]
+
+[columns]
+allow = ["customers.id", "customers.name", "customers.created_at"]
+deny = ["*.internal_notes", "orders.margin"]
+
+[privacy]
+sensitive_columns = ["ssn_custom", "secret_pin", "tax_identifier"]
+
+[features]
+allow_explain_query = true
+allow_schema_search = true
+allow_health_check = true
 ```
-
-If the executable is not on the client's PATH, use the full path to the virtual environment's `sqlite-guard-mcp` executable.
 
 ## Tools
 
@@ -87,8 +113,11 @@ If the executable is not on the client's PATH, use the full path to the virtual 
 |---|---|
 | `read_query(sql, params?)` | Run one read-only `SELECT`, `WITH`, or `VALUES` query with bound parameters. |
 | `list_database_tables()` | List user-defined tables and views. |
-| `describe_database_table(table_name)` | Inspect columns, types, primary keys, indexes, foreign keys, and masking metadata. |
-| `explain_read_query(sql, params?)` | Run `EXPLAIN QUERY PLAN` for a read-only query. |
+| `describe_database_table(table_name)` | Inspect columns, types, primary keys, indexes, foreign keys, unindexed FKs, and index overlap. |
+| `explain_read_query(sql, params?)` | Run `EXPLAIN QUERY PLAN` with structured observations and confidence scoring. |
+| `get_database_overview()` | Get safe database metrics: schema version, page size, page count, table/index/view counts. |
+| `search_database_schema(query, max_matches?)` | Search table names, column names, view names, and index names case-insensitively. |
+| `check_database_health()` | Run quick integrity check, check foreign key integrity, and report redundant indexes. |
 
 `params` accepts a JSON object for named parameters or an array for positional parameters. Example: `{"sql":"SELECT name FROM people WHERE id = ?","params":[7]}`.
 

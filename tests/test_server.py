@@ -318,6 +318,9 @@ async def test_official_mcp_client_lists_and_calls_tools(
             "list_database_tables",
             "describe_database_table",
             "explain_read_query",
+            "get_database_overview",
+            "search_database_schema",
+            "check_database_health",
         }
 
         result = await client.call_tool(
@@ -1399,7 +1402,7 @@ def test_schema_summary_byte_budget_and_object_failure(
     assert any(w["code"] == "schema_object_inspection_failed" for w in res_fail["warnings"])
 
     # Test response size truncation in inspect_schema_summary
-    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_RESULT_BYTES", 400)
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_RESULT_BYTES", 300)
     res = inspect_schema_summary(db)
     assert res["ok"] is True
     assert res["response_truncated"] is True

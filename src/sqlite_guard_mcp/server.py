@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
 import sqlite3
 import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field
 
 from . import __version__
+from .policy import AccessPolicy, default_policy, load_policy
 
 MAX_SQL_LENGTH = 100_000
 MAX_ROWS_HARD_LIMIT = 1_000
@@ -23,6 +28,11 @@ MAX_COLUMNS = 100
 MAX_CELL_TEXT = 4_096
 MAX_BLOB_BYTES = 4_096
 MAX_RESULT_BYTES = 1_000_000
+
+MAX_PARAMS_COUNT = 1_000
+MAX_PARAMS_TOTAL_BYTES = 1_000_000
+MAX_PARAM_KEY_LENGTH = 128
+MAX_SEARCH_RESULTS = 50
 
 SQLITE_INT64_MIN = -9_223_372_036_854_775_808
 SQLITE_INT64_MAX = 9_223_372_036_854_775_807
@@ -72,6 +82,7 @@ _TABLE_PRAGMAS = frozenset(
         "index_info",
         "index_xinfo",
         "foreign_key_list",
+        "foreign_key_check",
     }
 )
 
@@ -82,6 +93,10 @@ _NO_ARGUMENT_PRAGMAS = frozenset(
         "data_version",
         "quick_check",
         "integrity_check",
+        "schema_version",
+        "page_size",
+        "page_count",
+        "foreign_key_check",
     }
 )
 
@@ -182,6 +197,9 @@ def _is_sensitive_column(name: str | None) -> bool:
         .casefold()
     )
 
+    if not normalized:
+        return False
+
     if normalized in _SAFE_TOKEN_METRICS:
         return False
 
@@ -197,61 +215,82 @@ def _is_sensitive_column(name: str | None) -> bool:
     return any(f"_{phrase}_" in padded for phrase in _SENSITIVE_PHRASES)
 
 
-def _authorize(
-    action: int,
-    arg1: str | None,
-    arg2: str | None,
-    _database_name: str | None,
-    _source: str | None,
-) -> int:
-    """Permit safe reads, mask sensitive columns, and deny other actions."""
-    if action in {
-        sqlite3.SQLITE_SELECT,
-        getattr(sqlite3, "SQLITE_RECURSIVE", 33),
-    }:
-        return sqlite3.SQLITE_OK
+def _create_authorizer(policy: AccessPolicy | None = None) -> Any:
+    """Create a scoped SQLite authorizer callback enforcing policy and read-only protections."""
+    effective_policy = policy or default_policy()
 
-    if action == sqlite3.SQLITE_READ:
-        table_name = (arg1 or "").casefold()
-        column_name = (arg2 or "").casefold()
-
-        if table_name == "pragma_database_list":
-            return sqlite3.SQLITE_DENY
-
-        if table_name in _SCHEMA_TABLES and column_name == "sql":
-            return sqlite3.SQLITE_IGNORE
-
-        if (
-            table_name in {"pragma_table_info", "pragma_table_xinfo"}
-            and column_name == "dflt_value"
-        ):
-            return sqlite3.SQLITE_IGNORE
-
-        if _is_sensitive_column(arg2):
-            return sqlite3.SQLITE_IGNORE
-        return sqlite3.SQLITE_OK
-
-    if action == sqlite3.SQLITE_FUNCTION:
-        function_name = (arg2 or "").casefold()
-        if function_name in _BLOCKED_FUNCTIONS:
-            return sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK
-
-    if action == sqlite3.SQLITE_PRAGMA:
-        pragma = (arg1 or "").casefold()
-
-        if pragma == "database_list":
-            return sqlite3.SQLITE_DENY
-
-        if pragma in _TABLE_PRAGMAS:
+    def authorizer(
+        action: int,
+        arg1: str | None,
+        arg2: str | None,
+        _database_name: str | None,
+        _source: str | None,
+    ) -> int:
+        if action in {
+            sqlite3.SQLITE_SELECT,
+            getattr(sqlite3, "SQLITE_RECURSIVE", 33),
+        }:
             return sqlite3.SQLITE_OK
 
-        if pragma in _NO_ARGUMENT_PRAGMAS and arg2 is None:
+        if action == sqlite3.SQLITE_READ:
+            table_name = (arg1 or "").casefold()
+            column_name = (arg2 or "").casefold()
+
+            if table_name == "pragma_database_list":
+                return sqlite3.SQLITE_DENY
+
+            if arg1 and not effective_policy.is_table_allowed(arg1):
+                return sqlite3.SQLITE_DENY
+
+            if arg1 and arg2 and not effective_policy.is_column_allowed(arg1, arg2):
+                return sqlite3.SQLITE_DENY
+
+            if table_name in _SCHEMA_TABLES and column_name == "sql":
+                return sqlite3.SQLITE_IGNORE
+
+            if (
+                table_name in {"pragma_table_info", "pragma_table_xinfo"}
+                and column_name == "dflt_value"
+            ):
+                return sqlite3.SQLITE_IGNORE
+
+            if _is_sensitive_column(arg2) or (
+                arg1 and arg2 and effective_policy.is_column_sensitive(arg1, arg2)
+            ):
+                return sqlite3.SQLITE_IGNORE
+
             return sqlite3.SQLITE_OK
+
+        if action == sqlite3.SQLITE_FUNCTION:
+            function_name = (arg2 or "").casefold()
+            if function_name in _BLOCKED_FUNCTIONS:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        if action == sqlite3.SQLITE_PRAGMA:
+            pragma = (arg1 or "").casefold()
+
+            if pragma == "database_list":
+                return sqlite3.SQLITE_DENY
+
+            if pragma in _TABLE_PRAGMAS:
+                return sqlite3.SQLITE_OK
+
+            if pragma in {"quick_check", "integrity_check"}:
+                if arg2 is None or (isinstance(arg2, str) and arg2.isdigit()):
+                    return sqlite3.SQLITE_OK
+
+            if pragma in _NO_ARGUMENT_PRAGMAS and arg2 is None:
+                return sqlite3.SQLITE_OK
+
+            return sqlite3.SQLITE_DENY
 
         return sqlite3.SQLITE_DENY
 
-    return sqlite3.SQLITE_DENY
+    return authorizer
+
+
+_authorize = _create_authorizer(default_policy())
 
 
 def _validate_query(
@@ -301,7 +340,7 @@ def _validate_query(
             "WITH",
             "VALUES",
         }:
-            raise ValueError("EXPLAIN QUERY PLAN must contain a SELECT or WITH query.")
+            raise ValueError("Only SELECT, WITH, or VALUES queries can be explained.")
 
         return sql.strip()
 
@@ -311,16 +350,26 @@ def _validate_query(
 def _validate_params(
     params: Any,
 ) -> dict[str, Any] | list[Any] | tuple[Any, ...]:
-    """Validate SQLite scalar query parameters."""
+    """Validate SQLite scalar query parameters and enforce aggregate bounds."""
     if params is None:
         return ()
 
     if not isinstance(params, (dict, list, tuple)):
         raise ValueError("Query parameters must be an object, array, or null.")
 
+    if len(params) > MAX_PARAMS_COUNT:
+        raise ValueError(f"Query parameter count exceeds maximum limit of {MAX_PARAMS_COUNT}.")
+
+    total_bytes = 0
     if isinstance(params, dict):
-        if not all(isinstance(key, str) for key in params):
-            raise ValueError("Named query parameter keys must be strings.")
+        for key in params:
+            if not isinstance(key, str):
+                raise ValueError("Named query parameter keys must be strings.")
+            if len(key) > MAX_PARAM_KEY_LENGTH:
+                raise ValueError(
+                    f"Named parameter key length exceeds maximum limit of {MAX_PARAM_KEY_LENGTH}."
+                )
+            total_bytes += len(key.encode("utf-8"))
         values = params.values()
     else:
         values = params
@@ -338,24 +387,35 @@ def _validate_params(
                     f"Integer query parameter {value} is outside SQLite's signed 64-bit "
                     f"integer range ({SQLITE_INT64_MIN} to {SQLITE_INT64_MAX})."
                 )
+            total_bytes += 8
             continue
 
         if isinstance(value, float):
             if not math.isfinite(value):
                 raise ValueError("Floating-point query parameters must be finite.")
+            total_bytes += 8
             continue
 
         if isinstance(value, str):
+            val_bytes = len(value.encode("utf-8"))
             if len(value) > MAX_CELL_TEXT:
                 raise ValueError("A query parameter exceeds the maximum text length.")
+            total_bytes += val_bytes
             continue
 
         if isinstance(value, bytes):
             if len(value) > MAX_BLOB_BYTES:
                 raise ValueError("A BLOB query parameter exceeds the maximum byte length.")
+            total_bytes += len(value)
             continue
 
         raise ValueError("Query parameters must contain only SQLite scalar values.")
+
+    if total_bytes > MAX_PARAMS_TOTAL_BYTES:
+        raise ValueError(
+            f"Aggregate parameter size ({total_bytes} bytes) "
+            f"exceeds limit of {MAX_PARAMS_TOTAL_BYTES} bytes."
+        )
 
     return params
 
@@ -363,10 +423,11 @@ def _validate_params(
 def _open_connection(
     db_path: str | Path,
     *,
+    policy: AccessPolicy | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
 ) -> sqlite3.Connection:
-    """Open an existing database in read-only mode with execution limits."""
+    """Open an existing database in read-only mode with execution limits and authorizer."""
     path = Path(db_path).expanduser().resolve(strict=True)
 
     if not path.is_file():
@@ -414,13 +475,68 @@ def _open_connection(
             return int(time_exceeded or steps_exceeded)
 
         connection.set_progress_handler(progress, vm_interval)
-        connection.set_authorizer(_authorize)
+        connection.set_authorizer(_create_authorizer(policy))
 
         return connection
 
     except Exception:
         connection.close()
         raise
+
+
+def _fetch_bounded_rows(
+    cur: sqlite3.Cursor,
+    limit: int,
+) -> tuple[list[sqlite3.Row], bool]:
+    """Retrieve up to limit+1 rows from an active cursor to safely detect truncation."""
+    rows = cur.fetchmany(limit + 1)
+    is_truncated = len(rows) > limit
+    return rows[:limit], is_truncated
+
+
+def _record_audit_event(
+    audit_file: Path | str | None,
+    tool_name: str,
+    operation: str,
+    *,
+    sql: str | None = None,
+    status: str = "success",
+    row_count: int = 0,
+    response_bytes: int = 0,
+    duration_ms: float = 0.0,
+    error_code: str | None = None,
+    truncated: bool = False,
+) -> None:
+    """Safely append a privacy-safe audit record without leaking secrets."""
+    if not audit_file:
+        return
+    try:
+        path = Path(audit_file)
+        fingerprint = None
+        if sql:
+            fingerprint = hashlib.sha256(sql.strip().encode("utf-8")).hexdigest()[:16]
+
+        event: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "event_id": uuid.uuid4().hex[:12],
+            "tool": tool_name,
+            "operation": operation,
+            "duration_ms": duration_ms,
+            "status": status,
+            "row_count": row_count,
+            "response_bytes": response_bytes,
+            "truncated": truncated,
+        }
+        if fingerprint:
+            event["query_fingerprint"] = fingerprint
+        if error_code:
+            event["error_code"] = error_code
+
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 def _json_safe(value: Any) -> Any:
@@ -494,6 +610,7 @@ def _bounded_result(
         for row in rows
     ]
 
+    response_truncated = False
     payload: dict[str, Any] = {
         "ok": True,
         "columns": limited_columns,
@@ -501,6 +618,7 @@ def _bounded_result(
         "row_count": len(safe_rows),
         "truncated": truncated,
         "columns_truncated": columns_truncated,
+        "response_truncated": response_truncated,
         "elapsed_ms": elapsed_ms,
     }
 
@@ -508,13 +626,15 @@ def _bounded_result(
         safe_rows.pop()
         payload["row_count"] = len(safe_rows)
         payload["truncated"] = True
+        payload["response_truncated"] = True
 
     if _serialized_size(payload) > MAX_RESULT_BYTES:
         payload["rows"] = []
         payload["row_count"] = 0
         payload["truncated"] = True
         payload["columns_truncated"] = True
-        payload["warning"] = "The result exceeded the maximum response size and was omitted."
+        payload["response_truncated"] = True
+        payload["warning"] = "The result exceeded maximum response size and was omitted."
 
     return payload
 
@@ -527,26 +647,63 @@ def execute_guarded_query(
     max_rows: int = DEFAULT_MAX_ROWS,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    policy: AccessPolicy | None = None,
+    audit_file: Path | str | None = None,
     _allow_explain_plan: bool = False,
 ) -> dict[str, Any]:
     """Execute one parameterized, read-only SQL statement."""
-    if not 1 <= max_rows <= MAX_ROWS_HARD_LIMIT:
-        return _error(
-            f"max_rows must be between 1 and {MAX_ROWS_HARD_LIMIT}.",
-            "invalid_limit",
-        )
+    started_total = time.perf_counter()
 
-    if not 0.05 <= timeout_seconds <= 60:
-        return _error(
-            "timeout_seconds must be between 0.05 and 60.",
+    if (
+        isinstance(max_rows, bool)
+        or not isinstance(max_rows, int)
+        or not 1 <= max_rows <= MAX_ROWS_HARD_LIMIT
+    ):
+        err = _error(
+            f"max_rows must be an integer between 1 and {MAX_ROWS_HARD_LIMIT}.",
             "invalid_limit",
         )
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="error",
+            error_code="invalid_limit",
+        )
+        return err
 
-    if not 1_000 <= max_vm_steps <= 100_000_000:
-        return _error(
-            "max_vm_steps is outside the permitted range.",
-            "invalid_limit",
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0.05 <= timeout_seconds <= 60
+    ):
+        err = _error("timeout_seconds must be between 0.05 and 60.", "invalid_limit")
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="error",
+            error_code="invalid_limit",
         )
+        return err
+
+    if (
+        isinstance(max_vm_steps, bool)
+        or not isinstance(max_vm_steps, int)
+        or not 1_000 <= max_vm_steps <= 100_000_000
+    ):
+        err = _error("max_vm_steps is outside the permitted range.", "invalid_limit")
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="error",
+            error_code="invalid_limit",
+        )
+        return err
 
     try:
         statement = _validate_query(
@@ -556,39 +713,63 @@ def execute_guarded_query(
         bindings = _validate_params(params)
 
     except ValueError as exc:
-        return _error(str(exc), "invalid_input")
+        err = _error(str(exc), "invalid_input")
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="error",
+            error_code="invalid_input",
+        )
+        return err
 
     try:
         connection = _open_connection(
             db_path,
+            policy=policy,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
         )
 
     except FileNotFoundError:
-        return _error(
+        err = _error(
             "Database file was not found or is not a regular file.",
             "database_not_found",
         )
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="error",
+            error_code="database_not_found",
+        )
+        return err
 
     except (sqlite3.Error, OSError, RuntimeError):
-        return _error(
+        err = _error(
             "Could not open the database in read-only mode.",
             "database_open_failed",
         )
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="error",
+            error_code="database_open_failed",
+        )
+        return err
 
     started = time.perf_counter()
     cursor = None
 
     try:
         cursor = connection.execute(statement, bindings)
-        fetched = cursor.fetchmany(max_rows + 1)
-
-        was_truncated = len(fetched) > max_rows
-        selected = fetched[:max_rows]
+        selected, was_truncated = _fetch_bounded_rows(cursor, max_rows)
 
         columns = [item[0] for item in (cursor.description or [])]
-
         rows = [dict(row) for row in selected]
 
         elapsed = round(
@@ -596,70 +777,84 @@ def execute_guarded_query(
             3,
         )
 
-        return _bounded_result(
+        result = _bounded_result(
             columns,
             rows,
             was_truncated,
             elapsed,
         )
+        duration_ms = round((time.perf_counter() - started_total) * 1000, 2)
+        _record_audit_event(
+            audit_file,
+            "read_query",
+            "query",
+            sql=sql,
+            status="success",
+            row_count=result.get("row_count", 0),
+            response_bytes=_serialized_size(result),
+            duration_ms=duration_ms,
+            truncated=result.get("truncated", False),
+        )
+        return result
 
     except sqlite3.ProgrammingError as exc:
         reason = str(exc).casefold()
-        if "one statement" in reason:
-            return _error(
-                "Only a single SQL statement can be executed at a time.",
-                "invalid_input",
-            )
-        return _error(
-            f"SQLite parameter error: {exc}",
-            "invalid_input",
+        code = "invalid_input"
+        msg = (
+            "Only a single SQL statement can be executed at a time."
+            if "one statement" in reason
+            else f"SQLite parameter error: {exc}"
         )
+        err = _error(msg, code)
+        _record_audit_event(
+            audit_file, "read_query", "query", sql=sql, status="error", error_code=code
+        )
+        return err
 
     except sqlite3.OperationalError as exc:
         reason = str(exc).casefold()
-
         if "not authorized" in reason or "prohibited" in reason:
-            return _error(
-                "The SQLite authorizer blocked this operation.",
-                "blocked_operation",
-            )
-
-        if "interrupted" in reason:
-            return _error(
-                "The query exceeded its execution budget.",
-                "query_budget_exceeded",
-            )
-
-        return _error(
-            f"SQLite could not execute this query: {exc}",
-            "query_failed",
+            code = "blocked_operation"
+            msg = "The SQLite authorizer blocked this operation."
+        elif "interrupted" in reason:
+            code = "query_budget_exceeded"
+            msg = "The query exceeded its execution budget."
+        else:
+            code = "query_failed"
+            msg = f"SQLite could not execute this query: {exc}"
+        err = _error(msg, code)
+        _record_audit_event(
+            audit_file, "read_query", "query", sql=sql, status="error", error_code=code
         )
+        return err
 
     except sqlite3.DatabaseError as exc:
         reason = str(exc).casefold()
-
         if "not authorized" in reason or "prohibited" in reason:
-            return _error(
-                "The SQLite authorizer blocked this operation.",
-                "blocked_operation",
-            )
-
-        return _error(
-            f"SQLite could not execute this query: {exc}",
-            "query_failed",
+            code = "blocked_operation"
+            msg = "The SQLite authorizer blocked this operation."
+        else:
+            code = "query_failed"
+            msg = f"SQLite could not execute this query: {exc}"
+        err = _error(msg, code)
+        _record_audit_event(
+            audit_file, "read_query", "query", sql=sql, status="error", error_code=code
         )
+        return err
 
     except sqlite3.Error as exc:
-        return _error(
-            f"SQLite could not execute this query: {exc}",
-            "query_failed",
+        err = _error(f"SQLite could not execute this query: {exc}", "query_failed")
+        _record_audit_event(
+            audit_file, "read_query", "query", sql=sql, status="error", error_code="query_failed"
         )
+        return err
 
     except OverflowError as exc:
-        return _error(
-            f"Integer parameter overflow: {exc}",
-            "invalid_input",
+        err = _error(f"Integer parameter overflow: {exc}", "invalid_input")
+        _record_audit_event(
+            audit_file, "read_query", "query", sql=sql, status="error", error_code="invalid_input"
         )
+        return err
 
     finally:
         if cursor is not None:
@@ -673,9 +868,12 @@ def list_tables(
     max_rows: int = DEFAULT_MAX_ROWS,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    policy: AccessPolicy | None = None,
+    audit_file: Path | str | None = None,
 ) -> dict[str, Any]:
-    """List user-created tables and views."""
-    return execute_guarded_query(
+    """List user-created tables and views, filtered by active access policy."""
+    effective_policy = policy or default_policy()
+    res = execute_guarded_query(
         db_path,
         (
             "SELECT name, type FROM sqlite_schema "
@@ -685,7 +883,16 @@ def list_tables(
         max_rows=max_rows,
         timeout_seconds=timeout_seconds,
         max_vm_steps=max_vm_steps,
+        policy=effective_policy,
+        audit_file=audit_file,
     )
+    if res.get("ok"):
+        filtered_rows = [
+            row for row in res.get("rows", []) if effective_policy.is_table_allowed(row["name"])
+        ]
+        res["rows"] = filtered_rows
+        res["row_count"] = len(filtered_rows)
+    return res
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -705,8 +912,9 @@ def _analyze_indexes_for_table(
     columns: list[dict[str, Any]],
     indexes: list[dict[str, Any]],
     foreign_keys: list[dict[str, Any]],
+    pk_columns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Provide deterministic index intelligence and optimization recommendations."""
+    """Provide deterministic index intelligence, composite FK checking, and overlap diagnostics."""
     recommendations: list[str] = []
     unindexed_fks: list[str] = []
 
@@ -714,20 +922,52 @@ def _analyze_indexes_for_table(
     index_column_signatures: list[tuple[str, tuple[str, ...]]] = []
 
     for idx in indexes:
-        idx_cols = [str(c.get("name", "")) for c in idx.get("columns", []) if c.get("name")]
+        idx_cols = [
+            str(c.get("name", ""))
+            for c in idx.get("columns", [])
+            if c.get("name") and c.get("key", 1) == 1
+        ]
+        if not idx_cols:
+            idx_cols = [str(c.get("name", "")) for c in idx.get("columns", []) if c.get("name")]
+
         if idx_cols:
             indexed_leading_columns.add(idx_cols[0])
             index_column_signatures.append((str(idx.get("name", "")), tuple(idx_cols)))
 
+    fk_groups: dict[int, list[dict[str, Any]]] = {}
     for fk in foreign_keys:
-        from_col = fk.get("from")
-        if from_col and from_col not in indexed_leading_columns:
-            is_pk = any(col.get("name") == from_col and col.get("pk") for col in columns)
-            if not is_pk:
-                unindexed_fks.append(str(from_col))
+        fkid = fk.get("id", 0)
+        fk_groups.setdefault(fkid, []).append(fk)
+
+    for _fkid, group in fk_groups.items():
+        sorted_group = sorted(group, key=lambda x: x.get("seq", 0))
+        fk_cols = tuple(str(x.get("from", "")) for x in sorted_group if x.get("from"))
+        if not fk_cols:
+            continue
+
+        is_supported = False
+        for _, idx_cols in index_column_signatures:
+            if len(idx_cols) >= len(fk_cols) and idx_cols[: len(fk_cols)] == fk_cols:
+                is_supported = True
+                break
+
+        if not is_supported and pk_columns:
+            if len(pk_columns) >= len(fk_cols) and pk_columns[: len(fk_cols)] == fk_cols:
+                is_supported = True
+
+        if not is_supported:
+            fk_name = ", ".join(fk_cols)
+            unindexed_fks.append(fk_name)
+            if len(fk_cols) > 1:
                 recommendations.append(
-                    f"Foreign key column '{from_col}' lacks a supporting index with leading "
-                    f"column '{from_col}'. Adding an index on '{from_col}' can improve JOIN "
+                    f"Composite foreign key ({fk_name}) lacks a supporting index with prefix "
+                    f"({fk_name}). Adding an index on ({fk_name}) will optimize JOINs "
+                    "and referential integrity checks."
+                )
+            else:
+                recommendations.append(
+                    f"Foreign key column '{fk_name}' lacks a supporting index with leading "
+                    f"column '{fk_name}'. Adding an index on '{fk_name}' can improve JOIN "
                     "performance and referential integrity checks."
                 )
 
@@ -764,10 +1004,34 @@ def describe_table(
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    policy: AccessPolicy | None = None,
+    audit_file: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return table columns, indexes, foreign keys, and masking metadata."""
+    effective_policy = policy or default_policy()
+    started_total = time.perf_counter()
+
     if not isinstance(table_name, str) or not table_name.strip():
-        return _error("table_name must be a non-empty string.", "invalid_table_name")
+        err = _error("table_name must be a non-empty string.", "invalid_table_name")
+        _record_audit_event(
+            audit_file,
+            "describe_database_table",
+            "describe",
+            status="error",
+            error_code="invalid_table_name",
+        )
+        return err
+
+    if not effective_policy.is_table_allowed(table_name):
+        err = _error(f"Table '{table_name}' access is denied by policy.", "access_denied")
+        _record_audit_event(
+            audit_file,
+            "describe_database_table",
+            "describe",
+            status="error",
+            error_code="access_denied",
+        )
+        return err
 
     if (
         not isinstance(timeout_seconds, (int, float))
@@ -789,6 +1053,7 @@ def describe_table(
     try:
         connection = _open_connection(
             db_path,
+            policy=effective_policy,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
         )
@@ -804,73 +1069,94 @@ def describe_table(
         )
 
     try:
+        cur_cols = connection.execute(f"PRAGMA table_xinfo({quoted_table})")
+        try:
+            raw_columns, columns_truncated = _fetch_bounded_rows(cur_cols, MAX_COLUMNS)
+        finally:
+            cur_cols.close()
 
-        def _fetch_rows(query: str) -> list[sqlite3.Row]:
-            cur = connection.execute(query)
-            try:
-                return cur.fetchall()
-            finally:
-                cur.close()
-
-        raw_columns_all = _fetch_rows(f"PRAGMA table_xinfo({quoted_table})")
-        if not raw_columns_all:
+        if not raw_columns:
             return _error(
                 "The requested table or view does not exist.",
                 "table_not_found",
             )
 
-        columns_truncated = len(raw_columns_all) > MAX_COLUMNS
-        raw_columns = raw_columns_all[:MAX_COLUMNS]
-        columns = [dict(row) for row in raw_columns]
-
-        for column in columns:
-            col_name = str(column.get("name", ""))
-            is_sensitive = _is_sensitive_column(col_name)
-            column["masked_by_guard"] = is_sensitive
+        columns = []
+        pk_cols_list: list[tuple[int, str]] = []
+        for row in raw_columns:
+            col_name = str(row["name"])
+            if not effective_policy.is_column_allowed(table_name, col_name):
+                continue
+            item = dict(row)
+            is_sensitive = _is_sensitive_column(col_name) or effective_policy.is_column_sensitive(
+                table_name, col_name
+            )
+            item["masked_by_guard"] = is_sensitive
             if is_sensitive:
-                column["default_redacted"] = column.get("dflt_value") is not None
-                column["dflt_value"] = None
+                item["default_redacted"] = item.get("dflt_value") is not None
+                item["dflt_value"] = None
             else:
-                column["default_redacted"] = False
+                item["default_redacted"] = False
+            pk_val = item.get("pk", 0)
+            if pk_val > 0:
+                pk_cols_list.append((pk_val, col_name))
+            columns.append(item)
+
+        pk_cols_sorted = tuple(x[1] for x in sorted(pk_cols_list, key=lambda x: x[0]))
 
         indexes = []
-        raw_indexes_all = _fetch_rows(f"PRAGMA index_list({quoted_table})")
-        indexes_truncated = len(raw_indexes_all) > MAX_INDEXES
-        raw_indexes = raw_indexes_all[:MAX_INDEXES]
-        index_columns_truncated = False
+        cur_idx = connection.execute(f"PRAGMA index_list({quoted_table})")
+        try:
+            raw_indexes, indexes_truncated = _fetch_bounded_rows(cur_idx, MAX_INDEXES)
+        finally:
+            cur_idx.close()
 
+        index_columns_truncated = False
         for index in raw_indexes:
             item = dict(index)
             quoted_index = _quote_identifier(str(item["name"]))
-            raw_idx_cols_all = _fetch_rows(f"PRAGMA index_xinfo({quoted_index})")
-            if len(raw_idx_cols_all) > MAX_INDEX_COLUMNS:
-                index_columns_truncated = True
-            item["columns"] = [dict(row) for row in raw_idx_cols_all[:MAX_INDEX_COLUMNS]]
+            cur_idx_cols = connection.execute(f"PRAGMA index_xinfo({quoted_index})")
+            try:
+                raw_idx_cols, idx_trunc = _fetch_bounded_rows(cur_idx_cols, MAX_INDEX_COLUMNS)
+                if idx_trunc:
+                    index_columns_truncated = True
+                item["columns"] = [dict(r) for r in raw_idx_cols]
+            finally:
+                cur_idx_cols.close()
             indexes.append(item)
 
-        raw_fks_all = _fetch_rows(f"PRAGMA foreign_key_list({quoted_table})")
-        foreign_keys_truncated = len(raw_fks_all) > MAX_FOREIGN_KEYS
-        raw_fks = raw_fks_all[:MAX_FOREIGN_KEYS]
+        cur_fk = connection.execute(f"PRAGMA foreign_key_list({quoted_table})")
+        try:
+            raw_fks, foreign_keys_truncated = _fetch_bounded_rows(cur_fk, MAX_FOREIGN_KEYS)
+        finally:
+            cur_fk.close()
+
         foreign_keys = [dict(row) for row in raw_fks]
 
-        relationships = [
-            {
-                "from_column": fk.get("from"),
-                "target_table": fk.get("table"),
-                "target_column": fk.get("to"),
-                "on_update": fk.get("on_update"),
-                "on_delete": fk.get("on_delete"),
-            }
-            for fk in foreign_keys
-            if fk.get("from") and fk.get("table")
-        ]
+        relationships = []
+        for fk in foreign_keys:
+            relationships.append(
+                {
+                    "from_column": fk.get("from"),
+                    "target_table": fk.get("table"),
+                    "target_column": fk.get("to"),
+                    "on_update": fk.get("on_update"),
+                    "on_delete": fk.get("on_delete"),
+                }
+            )
 
-        index_intelligence = _analyze_indexes_for_table(columns, indexes, foreign_keys)
-        warnings: list[str] = []
+        index_intelligence = _analyze_indexes_for_table(
+            columns,
+            indexes,
+            foreign_keys,
+            pk_columns=pk_cols_sorted,
+        )
 
+        response_truncated = False
         payload: dict[str, Any] = {
             "ok": True,
             "table": table_name,
+            "table_name": table_name,
             "columns": columns,
             "indexes": indexes,
             "foreign_keys": foreign_keys,
@@ -886,27 +1172,51 @@ def describe_table(
             "indexes_truncated": indexes_truncated,
             "index_columns_truncated": index_columns_truncated,
             "foreign_keys_truncated": foreign_keys_truncated,
-            "response_truncated": False,
-            "warnings": warnings,
+            "response_truncated": response_truncated,
         }
 
-        if _serialized_size(payload) > MAX_RESULT_BYTES:
-            payload["response_truncated"] = True
+        while payload["indexes"] and _serialized_size(payload) > MAX_RESULT_BYTES:
+            payload["indexes"].pop()
+            payload["indexes_truncated"] = True
             payload["truncated"] = True
-            warnings.append("Schema metadata response exceeded byte budget and was truncated.")
-            for idx in payload["indexes"]:
-                idx["columns"] = idx["columns"][:2]
-            if _serialized_size(payload) > MAX_RESULT_BYTES:
-                payload["relationships"] = []
-                payload["indexes"] = payload["indexes"][:10]
+            payload["response_truncated"] = True
 
+        while payload["relationships"] and _serialized_size(payload) > MAX_RESULT_BYTES:
+            payload["relationships"].pop()
+            payload["truncated"] = True
+            payload["response_truncated"] = True
+
+        if _serialized_size(payload) > MAX_RESULT_BYTES:
+            payload["relationships"] = []
+            payload["indexes"] = payload["indexes"][:10]
+            payload["response_truncated"] = True
+
+        duration_ms = round((time.perf_counter() - started_total) * 1000, 2)
+        _record_audit_event(
+            audit_file,
+            "describe_database_table",
+            "describe",
+            status="success",
+            row_count=len(columns),
+            response_bytes=_serialized_size(payload),
+            duration_ms=duration_ms,
+            truncated=payload.get("truncated", False),
+        )
         return payload
 
     except sqlite3.Error:
-        return _error(
+        err = _error(
             "SQLite could not inspect this table's schema.",
             "schema_inspection_failed",
         )
+        _record_audit_event(
+            audit_file,
+            "describe_database_table",
+            "describe",
+            status="error",
+            error_code="schema_inspection_failed",
+        )
+        return err
     finally:
         connection.close()
 
@@ -916,6 +1226,7 @@ def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
     uses_index = False
     scans_table = False
     covering_index_detected = False
+    automatic_index_detected = False
     indexes_used: list[str] = []
     scanned_tables: list[str] = []
     temp_btree = False
@@ -945,21 +1256,48 @@ def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
                     idx_name = using_part[6:].split("(", 1)[0].strip().strip('"[]`')
                     if idx_name:
                         indexes_used.append(idx_name)
+                elif (
+                    "AUTOMATIC INDEX" in using_part.upper()
+                    or "AUTOMATIC COVERING INDEX" in using_part.upper()
+                ):
+                    automatic_index_detected = True
         elif "USING INTEGER PRIMARY KEY" in detail_upper:
             uses_index = True
 
         if detail_upper.startswith("SCAN "):
-            scans_table = True
             rest = detail[5:].strip()
             if rest.upper().startswith("TABLE "):
                 rest = rest[6:].strip()
-            tbl = (
-                re.split(r"\s+AS\s+|\s+USING\s+", rest, flags=re.IGNORECASE)[0]
-                .strip()
-                .strip('"[]`')
+            parts = re.split(r"\s+USING\s+", rest, maxsplit=1, flags=re.IGNORECASE)
+            table_part = (
+                re.split(r"\s+AS\s+", parts[0], flags=re.IGNORECASE)[0].strip().strip('"[]`')
             )
-            if tbl and tbl not in scanned_tables and not tbl.startswith("sqlite_"):
-                scanned_tables.append(tbl)
+
+            if len(parts) == 2:
+                using_part = parts[1].strip()
+                uses_index = True
+                if using_part.upper().startswith("COVERING INDEX "):
+                    covering_index_detected = True
+                    idx_name = using_part[15:].split("(", 1)[0].strip().strip('"[]`')
+                    if idx_name:
+                        indexes_used.append(idx_name)
+                elif using_part.upper().startswith("INDEX "):
+                    idx_name = using_part[6:].split("(", 1)[0].strip().strip('"[]`')
+                    if idx_name:
+                        indexes_used.append(idx_name)
+                elif (
+                    "AUTOMATIC INDEX" in using_part.upper()
+                    or "AUTOMATIC COVERING INDEX" in using_part.upper()
+                ):
+                    automatic_index_detected = True
+            else:
+                scans_table = True
+                if (
+                    table_part
+                    and table_part not in scanned_tables
+                    and not table_part.startswith("sqlite_")
+                ):
+                    scanned_tables.append(table_part)
 
     if scans_table and scanned_tables:
         for tbl in scanned_tables:
@@ -972,6 +1310,11 @@ def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "Query requires a temporary B-Tree for sorting or grouping. An index covering "
             "the ORDER BY or GROUP BY columns can eliminate sorting overhead."
         )
+    if automatic_index_detected:
+        recommendations.append(
+            "SQLite generated an ephemeral automatic index. Creating a permanent index will "
+            "avoid recurring index construction overhead."
+        )
     if not recommendations and uses_index:
         recommendations.append("Query is efficiently utilizing available indexes.")
 
@@ -980,6 +1323,7 @@ def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "index_search_detected": uses_index,
         "covering_index_detected": covering_index_detected,
         "temporary_sort_detected": temp_btree,
+        "automatic_index_detected": automatic_index_detected,
     }
 
     return {
@@ -1002,13 +1346,24 @@ def explain_query(
     max_rows: int = DEFAULT_MAX_ROWS,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    policy: AccessPolicy | None = None,
+    audit_file: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Return SQLite's query plan for a SELECT or WITH query."""
+    """Return SQLite's query plan and diagnostics for a SELECT or WITH query."""
     try:
         statement = _validate_query(sql, explain=True)
 
     except ValueError as exc:
-        return _error(str(exc), "invalid_input")
+        err = _error(str(exc), "invalid_input")
+        _record_audit_event(
+            audit_file,
+            "explain_read_query",
+            "explain",
+            sql=sql,
+            status="error",
+            error_code="invalid_input",
+        )
+        return err
 
     res = execute_guarded_query(
         db_path,
@@ -1017,6 +1372,8 @@ def explain_query(
         max_rows=max_rows,
         timeout_seconds=timeout_seconds,
         max_vm_steps=max_vm_steps,
+        policy=policy,
+        audit_file=audit_file,
         _allow_explain_plan=True,
     )
     if res.get("ok"):
@@ -1031,8 +1388,13 @@ def inspect_schema_summary(
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
     max_tables: int = MAX_SCHEMA_TABLES,
     max_columns_per_table: int = MAX_COLUMNS,
+    policy: AccessPolicy | None = None,
+    audit_file: Path | str | None = None,
 ) -> dict[str, Any]:
     """Provide a single-connection bounded summary of all tables, views, and schemas."""
+    effective_policy = policy or default_policy()
+    started_total = time.perf_counter()
+
     if isinstance(max_tables, bool) or not isinstance(max_tables, int) or max_tables <= 0:
         return _error("max_tables must be a positive integer.", "invalid_input")
     if max_tables > 10_000:
@@ -1064,6 +1426,7 @@ def inspect_schema_summary(
     try:
         connection = _open_connection(
             db_path,
+            policy=effective_policy,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
         )
@@ -1088,28 +1451,27 @@ def inspect_schema_summary(
     warnings: list[dict[str, Any]] = []
 
     try:
-
-        def _fetch_rows(query: str, params: Any = ()) -> list[sqlite3.Row]:
-            cur = connection.execute(query, params)
-            try:
-                return cur.fetchall()
-            finally:
-                cur.close()
-
-        count_rows = _fetch_rows(
+        cur_count = connection.execute(
             "SELECT count(*) AS cnt FROM sqlite_schema "
             "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'"
         )
-        total_tables = int(count_rows[0]["cnt"]) if count_rows else 0
+        try:
+            count_rows, _ = _fetch_bounded_rows(cur_count, 1)
+            total_tables = int(count_rows[0]["cnt"]) if count_rows else 0
+        finally:
+            cur_count.close()
 
-        table_rows = _fetch_rows(
+        cur_tables = connection.execute(
             "SELECT name, type FROM sqlite_schema "
             "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "
-            "ORDER BY name LIMIT ?",
-            (max_tables,),
+            "ORDER BY name"
         )
+        try:
+            table_rows, tables_truncated = _fetch_bounded_rows(cur_tables, max_tables)
+        finally:
+            cur_tables.close()
 
-        if total_tables > max_tables:
+        if total_tables > max_tables or tables_truncated:
             truncated = True
             tables_truncated = True
             warnings.append(
@@ -1142,9 +1504,19 @@ def inspect_schema_summary(
             tbl_name = row["name"]
             tbl_type = row["type"]
 
+            if not effective_policy.is_table_allowed(tbl_name):
+                continue
+
             try:
                 quoted = _quote_identifier(tbl_name)
-                raw_cols_all = _fetch_rows(f"PRAGMA table_xinfo({quoted})")
+                cur_cols = connection.execute(f"PRAGMA table_xinfo({quoted})")
+                try:
+                    raw_cols, col_trunc = _fetch_bounded_rows(cur_cols, max_columns_per_table)
+                    if col_trunc:
+                        columns_truncated = True
+                        truncated = True
+                finally:
+                    cur_cols.close()
             except Exception as exc:
                 truncated = True
                 warnings.append(
@@ -1163,15 +1535,14 @@ def inspect_schema_summary(
                 }
                 continue
 
-            if len(raw_cols_all) > max_columns_per_table:
-                columns_truncated = True
-                truncated = True
-
-            raw_cols = raw_cols_all[:max_columns_per_table]
             columns = []
             for col in raw_cols:
                 c_name = str(col["name"])
-                is_sens = _is_sensitive_column(c_name)
+                if not effective_policy.is_column_allowed(tbl_name, c_name):
+                    continue
+                is_sens = _is_sensitive_column(c_name) or effective_policy.is_column_sensitive(
+                    tbl_name, c_name
+                )
                 columns.append(
                     {
                         "name": c_name,
@@ -1182,95 +1553,586 @@ def inspect_schema_summary(
                     }
                 )
 
-            table_indexes = []
+            idx_list = []
             try:
-                raw_idx = _fetch_rows(f"PRAGMA index_list({quoted})")[:20]
-                for idx in raw_idx:
-                    table_indexes.append(
-                        {
-                            "name": str(idx["name"]),
-                            "unique": bool(idx["unique"]),
-                        }
-                    )
-            except Exception:
-                pass
+                cur_idx = connection.execute(f"PRAGMA index_list({quoted})")
+                try:
+                    raw_idx, _ = _fetch_bounded_rows(cur_idx, 20)
+                    idx_list = [dict(r)["name"] for r in raw_idx]
+                finally:
+                    cur_idx.close()
+            except Exception as exc:
+                warnings.append(
+                    {
+                        "code": "index_inspection_failed",
+                        "object": tbl_name,
+                        "message": (
+                            f"Could not inspect indexes for '{tbl_name}': {type(exc).__name__}"
+                        ),
+                    }
+                )
 
-            table_relationships = []
+            fk_list = []
             try:
-                raw_fks = _fetch_rows(f"PRAGMA foreign_key_list({quoted})")[:20]
-                for fk in raw_fks:
-                    if fk.get("from") and fk.get("table"):
-                        table_relationships.append(
-                            {
-                                "from_column": fk.get("from"),
-                                "target_table": fk.get("table"),
-                                "target_column": fk.get("to"),
-                            }
-                        )
-            except Exception:
-                pass
+                cur_fk = connection.execute(f"PRAGMA foreign_key_list({quoted})")
+                try:
+                    raw_fk, _ = _fetch_bounded_rows(cur_fk, 20)
+                    fk_list = [
+                        {
+                            "from": r["from"],
+                            "table": r["table"],
+                            "to": r["to"],
+                        }
+                        for r in raw_fk
+                    ]
+                finally:
+                    cur_fk.close()
+            except Exception as exc:
+                warnings.append(
+                    {
+                        "code": "foreign_key_inspection_failed",
+                        "object": tbl_name,
+                        "message": (
+                            f"Could not inspect foreign keys for '{tbl_name}': {type(exc).__name__}"
+                        ),
+                    }
+                )
 
             tables_dict[tbl_name] = {
                 "type": tbl_type,
                 "columns": columns,
-                "indexes": table_indexes,
-                "relationships": table_relationships,
+                "indexes": idx_list,
+                "relationships": fk_list,
             }
 
-        elapsed = round((time.monotonic() - started) * 1000, 3)
-        status = (
-            "complete"
-            if not truncated
-            and not any(w["code"] == "schema_object_inspection_failed" for w in warnings)
-            else "partial"
-        )
-        warning_str = "; ".join(w["message"] for w in warnings) if warnings else None
+        status = "partial" if (truncated or warnings) else "complete"
 
-        payload: dict[str, Any] = {
+        payload = {
             "ok": True,
-            "status": status,
-            "tables": tables_dict,
             "table_count": len(tables_dict),
-            "total_tables": total_tables,
+            "tables": tables_dict,
+            "status": status,
             "truncated": truncated,
             "tables_truncated": tables_truncated,
             "columns_truncated": columns_truncated,
             "time_truncated": time_truncated,
             "response_truncated": response_truncated,
-            "elapsed_ms": elapsed,
             "warnings": warnings,
         }
-        if warning_str:
-            payload["warning"] = warning_str
+
+        if tables_truncated:
+            payload["warning"] = f"Table count was capped at {max_tables}."
 
         while tables_dict and _serialized_size(payload) > MAX_RESULT_BYTES:
-            last_key = next(reversed(tables_dict))
+            last_key = list(tables_dict.keys())[-1]
             del tables_dict[last_key]
             payload["table_count"] = len(tables_dict)
             payload["truncated"] = True
             payload["response_truncated"] = True
             payload["status"] = "partial"
-            if not any(w.get("code") == "response_size_truncated" for w in warnings):
-                warnings.append(
-                    {
-                        "code": "response_size_truncated",
-                        "object": None,
-                        "message": (
-                            "Schema summary exceeded maximum response size and was truncated."
-                        ),
-                    }
-                )
-            payload["warning"] = "Schema summary exceeded maximum response size and was truncated."
 
+        duration_ms = round((time.perf_counter() - started_total) * 1000, 2)
+        _record_audit_event(
+            audit_file,
+            "schema://summary",
+            "schema_summary",
+            status="success",
+            row_count=payload.get("table_count", 0),
+            response_bytes=_serialized_size(payload),
+            duration_ms=duration_ms,
+            truncated=payload.get("truncated", False),
+        )
         return payload
 
-    except sqlite3.Error:
-        return _error(
-            "SQLite could not inspect the database schema.",
-            "schema_inspection_failed",
-        )
     finally:
         connection.close()
+
+
+def get_database_overview(
+    db_path: str | Path,
+    *,
+    policy: AccessPolicy | None = None,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    audit_file: Path | str | None = None,
+) -> dict[str, Any]:
+    """Provide a compact, privacy-safe architectural overview of the SQLite database."""
+    effective_policy = policy or default_policy()
+    started_total = time.perf_counter()
+
+    if not effective_policy.allow_database_overview:
+        err = _error("Database overview is disabled by policy.", "access_denied")
+        _record_audit_event(
+            audit_file,
+            "get_database_overview",
+            "overview",
+            status="error",
+            error_code="access_denied",
+        )
+        return err
+
+    try:
+        connection = _open_connection(
+            db_path,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+    except FileNotFoundError:
+        return _error(
+            "Database file was not found or is not a regular file.",
+            "database_not_found",
+        )
+    except (sqlite3.Error, OSError, RuntimeError):
+        return _error(
+            "Could not open the database in read-only mode.",
+            "database_open_failed",
+        )
+
+    try:
+        cur = connection.cursor()
+
+        cur.execute("PRAGMA schema_version")
+        row = cur.fetchone()
+        schema_version = int(row[0]) if row else 0
+
+        cur.execute("PRAGMA page_size")
+        row = cur.fetchone()
+        page_size = int(row[0]) if row else 4096
+
+        cur.execute("PRAGMA page_count")
+        row = cur.fetchone()
+        page_count = int(row[0]) if row else 0
+
+        approximate_size_bytes = page_size * page_count
+
+        cur.execute(
+            "SELECT type, name FROM sqlite_schema "
+            "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'index', 'trigger')"
+        )
+        rows = cur.fetchall()
+
+        table_count = 0
+        view_count = 0
+        index_count = 0
+        trigger_count = 0
+
+        for r in rows:
+            obj_type = r["type"]
+            name = r["name"]
+            if obj_type == "table":
+                if effective_policy.is_table_allowed(name):
+                    table_count += 1
+            elif obj_type == "view":
+                if effective_policy.is_table_allowed(name):
+                    view_count += 1
+            elif obj_type == "index":
+                index_count += 1
+            elif obj_type == "trigger":
+                trigger_count += 1
+
+        elapsed_ms = round((time.perf_counter() - started_total) * 1000, 2)
+        payload = {
+            "ok": True,
+            "sqlite_version": sqlite3.sqlite_version,
+            "schema_version": schema_version,
+            "page_size": page_size,
+            "page_count": page_count,
+            "approximate_size_bytes": approximate_size_bytes,
+            "table_count": table_count,
+            "view_count": view_count,
+            "index_count": index_count,
+            "trigger_count": trigger_count,
+            "read_only": True,
+            "elapsed_ms": elapsed_ms,
+            "status": "complete",
+        }
+        _record_audit_event(
+            audit_file,
+            "get_database_overview",
+            "overview",
+            status="success",
+            row_count=table_count + view_count,
+            response_bytes=_serialized_size(payload),
+            duration_ms=elapsed_ms,
+        )
+        return payload
+    except Exception as exc:
+        return _error(f"Database overview failed: {exc}", "overview_failed")
+    finally:
+        connection.close()
+
+
+def search_database_schema(
+    db_path: str | Path,
+    query: str,
+    *,
+    max_results: int = MAX_SEARCH_RESULTS,
+    policy: AccessPolicy | None = None,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    audit_file: Path | str | None = None,
+) -> dict[str, Any]:
+    """Search database tables, views, columns, and indexes for matching keywords."""
+    effective_policy = policy or default_policy()
+    started_total = time.perf_counter()
+
+    if not effective_policy.allow_schema_search:
+        err = _error("Schema search is disabled by policy.", "access_denied")
+        _record_audit_event(
+            audit_file,
+            "search_database_schema",
+            "search",
+            status="error",
+            error_code="access_denied",
+        )
+        return err
+
+    if not isinstance(query, str) or not query.strip():
+        return _error("Search query must be a non-empty string.", "invalid_input")
+
+    if len(query) > 256:
+        return _error("Search query exceeds maximum length of 256.", "invalid_input")
+
+    if (
+        isinstance(max_results, bool)
+        or not isinstance(max_results, int)
+        or not 1 <= max_results <= 200
+    ):
+        return _error("max_results must be an integer between 1 and 200.", "invalid_input")
+
+    try:
+        connection = _open_connection(
+            db_path,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+    except FileNotFoundError:
+        return _error(
+            "Database file was not found or is not a regular file.",
+            "database_not_found",
+        )
+    except (sqlite3.Error, OSError, RuntimeError):
+        return _error(
+            "Could not open the database in read-only mode.",
+            "database_open_failed",
+        )
+
+    target = query.strip().lower()
+    matches: list[dict[str, Any]] = []
+    truncated = False
+
+    try:
+        cur = connection.execute(
+            "SELECT name, type FROM sqlite_schema "
+            "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'index') "
+            "ORDER BY name"
+        )
+        schema_objects, _ = _fetch_bounded_rows(cur, 1000)
+        cur.close()
+
+        for obj in schema_objects:
+            if len(matches) >= max_results:
+                truncated = True
+                break
+
+            obj_name = obj["name"]
+            obj_type = obj["type"]
+            obj_lower = obj_name.lower()
+
+            if obj_type in ("table", "view"):
+                if not effective_policy.is_table_allowed(obj_name):
+                    continue
+
+                if target in obj_lower:
+                    match_type = (
+                        "exact"
+                        if target == obj_lower
+                        else ("prefix" if obj_lower.startswith(target) else "contains")
+                    )
+                    matches.append(
+                        {
+                            "object_type": obj_type,
+                            "table_name": obj_name,
+                            "name": obj_name,
+                            "match_type": match_type,
+                        }
+                    )
+
+                try:
+                    cur_c = connection.execute(f"PRAGMA table_xinfo({_quote_identifier(obj_name)})")
+                    raw_cols, _ = _fetch_bounded_rows(cur_c, MAX_COLUMNS)
+                    cur_c.close()
+
+                    for col in raw_cols:
+                        if len(matches) >= max_results:
+                            truncated = True
+                            break
+                        col_name = str(col["name"])
+                        if not effective_policy.is_column_allowed(obj_name, col_name):
+                            continue
+                        col_lower = col_name.lower()
+                        if target in col_lower:
+                            match_type = (
+                                "exact"
+                                if target == col_lower
+                                else ("prefix" if col_lower.startswith(target) else "contains")
+                            )
+                            matches.append(
+                                {
+                                    "object_type": "column",
+                                    "table_name": obj_name,
+                                    "name": col_name,
+                                    "data_type": col["type"],
+                                    "match_type": match_type,
+                                }
+                            )
+                except Exception:
+                    pass
+
+            elif obj_type == "index":
+                if target in obj_lower:
+                    match_type = (
+                        "exact"
+                        if target == obj_lower
+                        else ("prefix" if obj_lower.startswith(target) else "contains")
+                    )
+                    matches.append(
+                        {
+                            "object_type": "index",
+                            "name": obj_name,
+                            "match_type": match_type,
+                        }
+                    )
+
+        elapsed_ms = round((time.perf_counter() - started_total) * 1000, 2)
+        payload = {
+            "ok": True,
+            "query": query,
+            "matches": matches,
+            "match_count": len(matches),
+            "truncated": truncated,
+            "elapsed_ms": elapsed_ms,
+        }
+
+        while matches and _serialized_size(payload) > MAX_RESULT_BYTES:
+            matches.pop()
+            payload["match_count"] = len(matches)
+            payload["truncated"] = True
+
+        _record_audit_event(
+            audit_file,
+            "search_database_schema",
+            "search",
+            status="success",
+            row_count=len(matches),
+            response_bytes=_serialized_size(payload),
+            duration_ms=elapsed_ms,
+            truncated=truncated,
+        )
+        return payload
+    finally:
+        connection.close()
+
+
+def check_database_health(
+    db_path: str | Path,
+    *,
+    policy: AccessPolicy | None = None,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    audit_file: Path | str | None = None,
+) -> dict[str, Any]:
+    """Execute safe read-only integrity, foreign key, and index health diagnostics."""
+    effective_policy = policy or default_policy()
+    started_total = time.perf_counter()
+
+    if not effective_policy.allow_health_check:
+        err = _error("Database health check is disabled by policy.", "access_denied")
+        _record_audit_event(
+            audit_file,
+            "check_database_health",
+            "health",
+            status="error",
+            error_code="access_denied",
+        )
+        return err
+
+    try:
+        connection = _open_connection(
+            db_path,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+    except FileNotFoundError:
+        return _error(
+            "Database file was not found or is not a regular file.",
+            "database_not_found",
+        )
+    except (sqlite3.Error, OSError, RuntimeError):
+        return _error(
+            "Could not open the database in read-only mode.",
+            "database_open_failed",
+        )
+
+    checks: dict[str, Any] = {}
+    recommendations: list[str] = []
+    has_issues = False
+    has_warnings = False
+
+    try:
+        cur_q = connection.execute("PRAGMA quick_check(10)")
+        try:
+            q_rows, _ = _fetch_bounded_rows(cur_q, 10)
+            q_res = [r[0] for r in q_rows]
+            if q_res == ["ok"]:
+                checks["quick_check"] = {"status": "passed"}
+            else:
+                checks["quick_check"] = {"status": "failed", "details": q_res}
+                has_issues = True
+                recommendations.append("Database quick_check failed; verify disk or backup.")
+        finally:
+            cur_q.close()
+
+        cur_fk = connection.execute("PRAGMA foreign_key_check")
+        try:
+            fk_rows, fk_trunc = _fetch_bounded_rows(cur_fk, 20)
+            if not fk_rows:
+                checks["foreign_key_check"] = {"status": "passed"}
+            else:
+                violations = [
+                    {
+                        "table": r[0],
+                        "rowid": r[1],
+                        "target_table": r[2],
+                        "fkid": r[3],
+                    }
+                    for r in fk_rows
+                ]
+                checks["foreign_key_check"] = {
+                    "status": "violations_found",
+                    "violations": violations,
+                    "truncated": fk_trunc,
+                }
+                has_issues = True
+                recommendations.append(
+                    f"Found {len(violations)} foreign key constraint violations."
+                )
+        finally:
+            cur_fk.close()
+
+        cur_tbl = connection.execute(
+            "SELECT name FROM sqlite_schema "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        try:
+            tbl_rows, _ = _fetch_bounded_rows(cur_tbl, 50)
+            table_names = [
+                r["name"] for r in tbl_rows if effective_policy.is_table_allowed(r["name"])
+            ]
+        finally:
+            cur_tbl.close()
+
+        unindexed_fks_all = []
+        duplicate_indexes_all = []
+
+        for tbl in table_names:
+            try:
+                desc = describe_table(
+                    db_path,
+                    tbl,
+                    policy=effective_policy,
+                    timeout_seconds=timeout_seconds,
+                    max_vm_steps=max_vm_steps,
+                )
+                if desc.get("ok"):
+                    intel = desc.get("index_intelligence", {})
+                    for ufk in intel.get("unindexed_foreign_keys", []):
+                        unindexed_fks_all.append(f"{tbl}.{ufk}")
+                    for rec in intel.get("recommendations", []):
+                        if "Duplicate indexes" in rec or "is a prefix of" in rec:
+                            duplicate_indexes_all.append(rec)
+            except Exception:
+                pass
+
+        if unindexed_fks_all:
+            has_warnings = True
+            recommendations.append(
+                f"Unindexed foreign keys found: {', '.join(unindexed_fks_all[:5])}."
+            )
+        if duplicate_indexes_all:
+            has_warnings = True
+            recommendations.extend(duplicate_indexes_all[:3])
+
+        checks["index_health"] = {
+            "unindexed_foreign_keys": unindexed_fks_all,
+            "index_redundancies": duplicate_indexes_all,
+        }
+
+        overall_status = "healthy"
+        if has_issues:
+            overall_status = "issues_detected"
+        elif has_warnings:
+            overall_status = "warnings_detected"
+
+        elapsed_ms = round((time.perf_counter() - started_total) * 1000, 2)
+        payload = {
+            "ok": True,
+            "overall_status": overall_status,
+            "checks": checks,
+            "recommendations": list(dict.fromkeys(recommendations)),
+            "elapsed_ms": elapsed_ms,
+        }
+
+        _record_audit_event(
+            audit_file,
+            "check_database_health",
+            "health",
+            status="success",
+            duration_ms=elapsed_ms,
+        )
+        return payload
+    finally:
+        connection.close()
+
+
+class BearerAuthMiddleware:
+    """ASGI middleware enforcing Bearer token authentication."""
+
+    def __init__(self, app: Any, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            auth_val = headers.get(b"authorization", b"").decode("latin-1", errors="replace")
+            scheme, _, received_token = auth_val.partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                received_token.strip(), self.token.strip()
+            ):
+                response_body = b'{"error":"Unauthorized: invalid or missing Bearer token."}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(response_body)).encode("ascii")),
+                            (b"www-authenticate", b'Bearer realm="sqlite-guard-mcp"'),
+                        ],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": response_body,
+                    }
+                )
+                return
+        await self.app(scope, receive, send)
 
 
 def create_server(
@@ -1279,11 +2141,15 @@ def create_server(
     max_rows: int = DEFAULT_MAX_ROWS,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    policy: AccessPolicy | None = None,
+    audit_file: Path | str | None = None,
+    auth_token: str | None = None,
 ) -> Any:
     """Create the official MCP SDK server with SQLite Guard tools and schema resources."""
     from mcp.server.mcpserver import MCPServer
 
     database = Path(db_path).expanduser()
+    effective_policy = policy or default_policy()
 
     server = MCPServer(
         "sqlite-guard-mcp",
@@ -1295,6 +2161,7 @@ def create_server(
             "Use parameterized SQL for user-provided values."
         ),
     )
+    server.auth_token = auth_token  # type: ignore[attr-defined]
 
     @server.tool()
     def read_query(
@@ -1321,6 +2188,8 @@ def create_server(
             max_rows=max_rows,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
+            policy=effective_policy,
+            audit_file=audit_file,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -1332,6 +2201,8 @@ def create_server(
             max_rows=max_rows,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
+            policy=effective_policy,
+            audit_file=audit_file,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -1348,6 +2219,8 @@ def create_server(
             table_name,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
+            policy=effective_policy,
+            audit_file=audit_file,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -1376,6 +2249,64 @@ def create_server(
             max_rows=max_rows,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
+            policy=effective_policy,
+            audit_file=audit_file,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    _db_overview = globals()["get_database_overview"]
+    _schema_search = globals()["search_database_schema"]
+    _health_check = globals()["check_database_health"]
+
+    @server.tool()
+    def get_database_overview() -> str:
+        """Get a safe overview of database metrics (table count, size, schema version)."""
+        result = _db_overview(
+            database,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+            audit_file=audit_file,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def search_database_schema(
+        query: Annotated[
+            str,
+            Field(
+                description="Case-insensitive search term for tables, views, columns, or indexes."
+            ),
+        ],
+        max_results: Annotated[
+            int,
+            Field(
+                default=MAX_SEARCH_RESULTS,
+                description="Maximum number of search matches to return (1-200).",
+            ),
+        ] = MAX_SEARCH_RESULTS,
+    ) -> str:
+        """Search database schema objects (tables, views, columns, indexes) by keyword."""
+        result = _schema_search(
+            database,
+            query,
+            max_results=max_results,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+            audit_file=audit_file,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def check_database_health() -> str:
+        """Run read-only database health checks (quick_check, foreign keys, index health)."""
+        result = _health_check(
+            database,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+            audit_file=audit_file,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -1386,6 +2317,8 @@ def create_server(
             database,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
+            policy=effective_policy,
+            audit_file=audit_file,
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -1428,6 +2361,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum SQLite virtual-machine steps.",
     )
     parser.add_argument(
+        "--policy",
+        default=os.environ.get("SQLITE_GUARD_POLICY"),
+        help="Path to a TOML access policy configuration file.",
+    )
+    parser.add_argument(
+        "--audit-log",
+        default=os.environ.get("SQLITE_GUARD_AUDIT_LOG"),
+        help="Path to append audit events (JSON Lines format).",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("SQLITE_GUARD_AUTH_TOKEN"),
+        help="Bearer authentication token for HTTP/SSE transports.",
+    )
+    parser.add_argument(
         "--transport",
         choices=["stdio", "sse", "streamable-http"],
         default="stdio",
@@ -1467,27 +2415,51 @@ def main(argv: list[str] | None = None) -> int:
     if not database.is_file():
         parser.error("The configured database path is not a regular file.")
 
+    policy = None
+    if args.policy:
+        try:
+            policy = load_policy(args.policy)
+        except ValueError as exc:
+            parser.error(f"Policy configuration error: {exc}")
+
     server = create_server(
         database,
         max_rows=args.max_rows,
         timeout_seconds=args.timeout,
         max_vm_steps=args.max_vm_steps,
+        policy=policy,
+        audit_file=args.audit_log,
+        auth_token=args.auth_token,
     )
     try:
         if args.transport == "stdio":
             server.run(transport="stdio")
         elif args.transport == "streamable-http":
-            server.run(
-                transport="streamable-http",
-                host=args.host,
-                port=args.port,
-            )
+            if args.auth_token:
+                import uvicorn
+
+                app = server.streamable_http_app(streamable_http_path="/mcp")
+                wrapped = BearerAuthMiddleware(app, args.auth_token)
+                uvicorn.run(wrapped, host=args.host, port=args.port)
+            else:
+                server.run(
+                    transport="streamable-http",
+                    host=args.host,
+                    port=args.port,
+                )
         elif args.transport == "sse":
-            server.run(
-                transport="sse",
-                host=args.host,
-                port=args.port,
-            )
+            if args.auth_token:
+                import uvicorn
+
+                app = server.sse_app(sse_path="/sse", message_path="/messages")
+                wrapped = BearerAuthMiddleware(app, args.auth_token)
+                uvicorn.run(wrapped, host=args.host, port=args.port)
+            else:
+                server.run(
+                    transport="sse",
+                    host=args.host,
+                    port=args.port,
+                )
     except (KeyboardInterrupt, EOFError):
         pass
     return 0

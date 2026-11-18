@@ -13,6 +13,10 @@ Please do not publish exploitable details in a public issue. Contact the reposit
 SQLite Guard opens the configured database using SQLite's read-only URI mode, enables `query_only`, disables trusted schema, installs a SQLite authorizer, applies SQLite resource limits where supported, and uses a progress handler to bound query work. Sensitive columns are masked at SQLite's authorizer boundary when their names match the documented patterns.
 
 Key protections in version 0.2.1 include:
+- **Fail-closed access policy engine:** Enforces granular table and column allow/deny lists and custom sensitive column masking at SQLite's authorizer boundary. Denied objects cannot be read, selected, or joined.
+- **HTTP/SSE Bearer authentication:** `BearerAuthMiddleware` enforces constant-time token comparison across all non-stdio transports to prevent unauthorized network access.
+- **Privacy-safe audit logging:** Logs operations with query SHA-256 fingerprints, execution duration, and row counts, eliminating credential leakage in log sinks.
+- **Aggregate query parameter bounding:** Restricts parameter counts (1,000), total parameter memory (1 MB), and key lengths (128 chars) to guard against resource exhaustion and denial of service.
 - **Database-path introspection denied:** `PRAGMA database_list` and table-valued `pragma_database_list` are rejected by authorizer policy to avoid exposing filesystem paths.
 - **Schema DDL SQL masking:** The `sql` column of `sqlite_schema`, `sqlite_master`, `sqlite_temp_schema`, and `sqlite_temp_master` is evaluated as `NULL` via the SQLite authorizer, preventing extraction of plaintext passwords or credentials defined in `DEFAULT` clauses or constraints.
 - **Sensitive default redaction:** `describe_database_table` and `schema://summary` redact sensitive default values (`dflt_value: null`, `default_redacted: true`) while preserving non-sensitive defaults and types.
