@@ -24,6 +24,10 @@ MAX_CELL_TEXT = 4_096
 MAX_BLOB_BYTES = 4_096
 MAX_RESULT_BYTES = 1_000_000
 
+SQLITE_INT64_MIN = -9_223_372_036_854_775_808
+SQLITE_INT64_MAX = 9_223_372_036_854_775_807
+MAX_SCHEMA_TABLES = 500
+
 DEFAULT_MAX_ROWS = 250
 DEFAULT_TIMEOUT_SECONDS = 2.0
 DEFAULT_MAX_VM_STEPS = 250_000
@@ -73,6 +77,8 @@ _NO_ARGUMENT_PRAGMAS = frozenset(
         "compile_options",
         "encoding",
         "data_version",
+        "quick_check",
+        "integrity_check",
     }
 )
 
@@ -317,19 +323,33 @@ def _validate_params(
         values = params
 
     for value in values:
-        if value is None or isinstance(value, (str, int, float, bytes)):
-            if isinstance(value, float) and not math.isfinite(value):
-                raise ValueError("Floating-point query parameters must be finite.")
-
-            if isinstance(value, str) and len(value) > MAX_CELL_TEXT:
-                raise ValueError("A query parameter exceeds the maximum text length.")
-
-            if isinstance(value, bytes) and len(value) > MAX_BLOB_BYTES:
-                raise ValueError("A BLOB query parameter exceeds the maximum byte length.")
-
+        if value is None:
             continue
 
         if isinstance(value, bool):
+            continue
+
+        if isinstance(value, int):
+            if not (SQLITE_INT64_MIN <= value <= SQLITE_INT64_MAX):
+                raise ValueError(
+                    f"Integer query parameter {value} is outside SQLite's signed 64-bit "
+                    f"integer range ({SQLITE_INT64_MIN} to {SQLITE_INT64_MAX})."
+                )
+            continue
+
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("Floating-point query parameters must be finite.")
+            continue
+
+        if isinstance(value, str):
+            if len(value) > MAX_CELL_TEXT:
+                raise ValueError("A query parameter exceeds the maximum text length.")
+            continue
+
+        if isinstance(value, bytes):
+            if len(value) > MAX_BLOB_BYTES:
+                raise ValueError("A BLOB query parameter exceeds the maximum byte length.")
             continue
 
         raise ValueError("Query parameters must contain only SQLite scalar values.")
@@ -580,7 +600,19 @@ def execute_guarded_query(
             elapsed,
         )
 
-    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+    except sqlite3.ProgrammingError as exc:
+        reason = str(exc).casefold()
+        if "one statement" in reason:
+            return _error(
+                "Only a single SQL statement can be executed at a time.",
+                "invalid_input",
+            )
+        return _error(
+            f"SQLite parameter error: {exc}",
+            "invalid_input",
+        )
+
+    except sqlite3.OperationalError as exc:
         reason = str(exc).casefold()
 
         if "not authorized" in reason or "prohibited" in reason:
@@ -600,22 +632,30 @@ def execute_guarded_query(
             "query_failed",
         )
 
-    except sqlite3.ProgrammingError as exc:
+    except sqlite3.DatabaseError as exc:
         reason = str(exc).casefold()
-        if "one statement" in reason:
+
+        if "not authorized" in reason or "prohibited" in reason:
             return _error(
-                "Only a single SQL statement can be executed at a time.",
-                "invalid_input",
+                "The SQLite authorizer blocked this operation.",
+                "blocked_operation",
             )
+
         return _error(
-            f"SQLite parameter error: {exc}",
-            "invalid_input",
+            f"SQLite could not execute this query: {exc}",
+            "query_failed",
         )
 
     except sqlite3.Error as exc:
         return _error(
             f"SQLite could not execute this query: {exc}",
             "query_failed",
+        )
+
+    except OverflowError as exc:
+        return _error(
+            f"Integer parameter overflow: {exc}",
+            "invalid_input",
         )
 
     finally:
@@ -738,12 +778,33 @@ def describe_table(
             for row in _fetch_rows(f"PRAGMA foreign_key_list({quoted_table})")[:MAX_COLUMNS]
         ]
 
+        relationships = [
+            {
+                "from_column": fk.get("from"),
+                "target_table": fk.get("table"),
+                "target_column": fk.get("to"),
+                "on_update": fk.get("on_update"),
+                "on_delete": fk.get("on_delete"),
+            }
+            for fk in foreign_keys
+            if fk.get("from") and fk.get("table")
+        ]
+
+        columns_truncated = len(raw_columns) == MAX_COLUMNS
+        indexes_truncated = len(raw_indexes) == MAX_COLUMNS
+        foreign_keys_truncated = len(foreign_keys) == MAX_COLUMNS
+
         return {
             "ok": True,
             "table": table_name,
             "columns": columns,
             "indexes": indexes,
             "foreign_keys": foreign_keys,
+            "relationships": relationships,
+            "truncated": columns_truncated or indexes_truncated or foreign_keys_truncated,
+            "columns_truncated": columns_truncated,
+            "indexes_truncated": indexes_truncated,
+            "foreign_keys_truncated": foreign_keys_truncated,
         }
 
     except sqlite3.Error:
@@ -754,6 +815,59 @@ def describe_table(
 
     finally:
         connection.close()
+
+
+def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Provide structured, evidence-based diagnostics for an EXPLAIN QUERY PLAN."""
+    uses_index = False
+    scans_table = False
+    indexes_used: list[str] = []
+    scanned_tables: list[str] = []
+    temp_btree = False
+    recommendations: list[str] = []
+
+    for row in rows:
+        detail = str(row.get("detail", ""))
+
+        idx_match = re.search(r"USING (?:COVERING )?INDEX (\w+)", detail)
+        if idx_match:
+            uses_index = True
+            indexes_used.append(idx_match.group(1))
+        elif "USING INTEGER PRIMARY KEY" in detail:
+            uses_index = True
+
+        scan_match = re.search(r"SCAN (?:TABLE )?(\w+)", detail)
+        if scan_match:
+            scans_table = True
+            tbl = scan_match.group(1)
+            if tbl not in scanned_tables and not tbl.startswith("sqlite_"):
+                scanned_tables.append(tbl)
+
+        if "USE TEMP B-TREE" in detail:
+            temp_btree = True
+
+    if scans_table and scanned_tables:
+        for tbl in scanned_tables:
+            recommendations.append(
+                f"Full table scan detected on '{tbl}'. If this table is large and "
+                "query performance is critical, consider adding an index on filter or join columns."
+            )
+    if temp_btree:
+        recommendations.append(
+            "Query requires a temporary B-Tree for sorting or grouping. An index covering "
+            "the ORDER BY or GROUP BY columns can eliminate sorting overhead."
+        )
+    if not recommendations and uses_index:
+        recommendations.append("Query is efficiently utilizing available indexes.")
+
+    return {
+        "uses_index": uses_index,
+        "scans_table": scans_table,
+        "indexes_used": list(dict.fromkeys(indexes_used)),
+        "scanned_tables": scanned_tables,
+        "uses_temp_btree": temp_btree,
+        "recommendations": recommendations,
+    }
 
 
 def explain_query(
@@ -772,7 +886,7 @@ def explain_query(
     except ValueError as exc:
         return _error(str(exc), "invalid_input")
 
-    return execute_guarded_query(
+    res = execute_guarded_query(
         db_path,
         statement,
         params,
@@ -781,6 +895,132 @@ def explain_query(
         max_vm_steps=max_vm_steps,
         _allow_explain_plan=True,
     )
+    if res.get("ok"):
+        res["diagnostics"] = _analyze_query_plan(res.get("rows", []))
+    return res
+
+
+def inspect_schema_summary(
+    db_path: str | Path,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
+    max_tables: int = MAX_SCHEMA_TABLES,
+    max_columns_per_table: int = MAX_COLUMNS,
+) -> dict[str, Any]:
+    """Provide a single-connection bounded summary of all tables, views, and schemas."""
+    try:
+        connection = _open_connection(
+            db_path,
+            timeout_seconds=timeout_seconds,
+            max_vm_steps=max_vm_steps,
+        )
+    except FileNotFoundError:
+        return _error(
+            "Database file was not found or is not a regular file.",
+            "database_not_found",
+        )
+    except (sqlite3.Error, OSError, RuntimeError):
+        return _error(
+            "Could not open the database in read-only mode.",
+            "database_open_failed",
+        )
+
+    started = time.monotonic()
+    tables_dict: dict[str, Any] = {}
+    truncated = False
+    warning = None
+
+    try:
+
+        def _fetch_rows(query: str, params: Any = ()) -> list[sqlite3.Row]:
+            cur = connection.execute(query, params)
+            try:
+                return cur.fetchall()
+            finally:
+                cur.close()
+
+        table_rows = _fetch_rows(
+            "SELECT name, type FROM sqlite_schema "
+            "WHERE type IN ('table', 'view') "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        total_tables = len(table_rows)
+
+        if total_tables > max_tables:
+            truncated = True
+            warning = (
+                f"Database contains {total_tables} tables/views; summary capped at {max_tables}."
+            )
+            selected_tables = table_rows[:max_tables]
+        else:
+            selected_tables = table_rows
+
+        for row in selected_tables:
+            if (time.monotonic() - started) >= timeout_seconds:
+                truncated = True
+                warning = (
+                    f"Schema summary timed out after {timeout_seconds}s and was partially returned."
+                )
+                break
+
+            tbl_name = row["name"]
+            tbl_type = row["type"]
+
+            try:
+                quoted = _quote_identifier(tbl_name)
+                raw_cols = _fetch_rows(f"PRAGMA table_xinfo({quoted})")[:max_columns_per_table]
+            except Exception:
+                continue
+
+            columns = []
+            for col in raw_cols:
+                c_name = str(col["name"])
+                is_sens = _is_sensitive_column(c_name)
+                columns.append(
+                    {
+                        "name": c_name,
+                        "type": col["type"],
+                        "pk": bool(col["pk"]),
+                        "masked": is_sens,
+                        "default_redacted": is_sens and col["dflt_value"] is not None,
+                    }
+                )
+
+            tables_dict[tbl_name] = {
+                "type": tbl_type,
+                "columns": columns,
+            }
+
+        elapsed = round((time.monotonic() - started) * 1000, 3)
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "tables": tables_dict,
+            "table_count": len(tables_dict),
+            "total_tables": total_tables,
+            "truncated": truncated,
+            "elapsed_ms": elapsed,
+        }
+        if warning:
+            payload["warning"] = warning
+
+        while tables_dict and _serialized_size(payload) > MAX_RESULT_BYTES:
+            last_key = next(reversed(tables_dict))
+            del tables_dict[last_key]
+            payload["table_count"] = len(tables_dict)
+            payload["truncated"] = True
+            payload["warning"] = "Schema summary exceeded maximum response size and was truncated."
+
+        return payload
+
+    except sqlite3.Error:
+        return _error(
+            "SQLite could not inspect the database schema.",
+            "schema_inspection_failed",
+        )
+    finally:
+        connection.close()
 
 
 def create_server(
@@ -892,46 +1132,18 @@ def create_server(
     @server.resource("schema://summary")
     def database_schema_summary() -> str:
         """Provide a summary of all user-created tables, views, and column definitions."""
-        tables_res = list_tables(
+        result = inspect_schema_summary(
             database,
-            max_rows=MAX_ROWS_HARD_LIMIT,
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
         )
-        if not tables_res.get("ok"):
-            return json.dumps(tables_res, ensure_ascii=False)
-
-        summary: dict[str, Any] = {"tables": {}}
-        for row in tables_res.get("rows", []):
-            name = row.get("name")
-            if name:
-                table_info = describe_table(
-                    database,
-                    name,
-                    timeout_seconds=timeout_seconds,
-                    max_vm_steps=max_vm_steps,
-                )
-                if table_info.get("ok"):
-                    summary["tables"][name] = {
-                        "type": row.get("type"),
-                        "columns": [
-                            {
-                                "name": col.get("name"),
-                                "type": col.get("type"),
-                                "pk": bool(col.get("pk")),
-                                "masked": col.get("masked_by_guard", False),
-                                "default_redacted": col.get("default_redacted", False),
-                            }
-                            for col in table_info.get("columns", [])
-                        ],
-                    }
-        return json.dumps(summary, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False)
 
     return server
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the SQLite Guard MCP server over standard input/output."""
+    """Run the SQLite Guard MCP server over standard input/output or HTTP transports."""
     parser = argparse.ArgumentParser(
         prog="sqlite-guard-mcp",
         description="Read-only, security-hardened SQLite MCP server.",
@@ -971,6 +1183,17 @@ def main(argv: list[str] | None = None) -> int:
         default="stdio",
         help="MCP transport to run (default: stdio).",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host address to bind for HTTP/SSE transports (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind for HTTP/SSE transports (default: 8000).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -1001,7 +1224,20 @@ def main(argv: list[str] | None = None) -> int:
         max_vm_steps=args.max_vm_steps,
     )
     try:
-        server.run(transport=args.transport)
+        if args.transport == "stdio":
+            server.run(transport="stdio")
+        elif args.transport == "streamable-http":
+            server.run(
+                transport="streamable-http",
+                host=args.host,
+                port=args.port,
+            )
+        elif args.transport == "sse":
+            server.run(
+                transport="sse",
+                host=args.host,
+                port=args.port,
+            )
     except (KeyboardInterrupt, EOFError):
         pass
     return 0

@@ -11,10 +11,13 @@ import pytest
 
 from sqlite_guard_mcp.server import (
     MAX_RESULT_BYTES,
+    SQLITE_INT64_MAX,
+    SQLITE_INT64_MIN,
     create_server,
     describe_table,
     execute_guarded_query,
     explain_query,
+    inspect_schema_summary,
     list_tables,
 )
 
@@ -979,3 +982,280 @@ def test_connection_and_cursor_lifecycle(database: Path) -> None:
     assert desc_ok["ok"] is True
     desc_err = describe_table(database, "nonexistent")
     assert desc_err["ok"] is False
+
+
+def test_integer_parameter_boundaries_and_overflow(database: Path) -> None:
+    # Test valid boundary values
+    res_max = execute_guarded_query(database, "SELECT ?", [SQLITE_INT64_MAX])
+    assert res_max["ok"] is True
+    assert list(res_max["rows"][0].values())[0] == SQLITE_INT64_MAX
+
+    res_min = execute_guarded_query(database, "SELECT ?", [SQLITE_INT64_MIN])
+    assert res_min["ok"] is True
+    assert list(res_min["rows"][0].values())[0] == SQLITE_INT64_MIN
+
+    # Test values immediately outside boundaries
+    res_overflow = execute_guarded_query(database, "SELECT ?", [SQLITE_INT64_MAX + 1])
+    assert res_overflow["ok"] is False
+    assert res_overflow["code"] == "invalid_input"
+    assert "signed 64-bit integer range" in res_overflow["error"]
+
+    res_underflow = execute_guarded_query(database, "SELECT ?", [SQLITE_INT64_MIN - 1])
+    assert res_underflow["ok"] is False
+    assert res_underflow["code"] == "invalid_input"
+    assert "signed 64-bit integer range" in res_underflow["error"]
+
+    # Test boolean parameters are preserved and not rejected
+    res_bool = execute_guarded_query(database, "SELECT ?, ?", [True, False])
+    assert res_bool["ok"] is True
+
+
+def test_exception_hierarchy_and_classification(database: Path) -> None:
+    # Multiple statements should return invalid_input (ProgrammingError)
+    res_multi = execute_guarded_query(database, "SELECT 1; SELECT 2")
+    assert res_multi["ok"] is False
+    assert res_multi["code"] == "invalid_input"
+
+    # Parameter count mismatch should return invalid_input (ProgrammingError)
+    res_param_mismatch = execute_guarded_query(database, "SELECT ?, ?", [1])
+    assert res_param_mismatch["ok"] is False
+    assert res_param_mismatch["code"] == "invalid_input"
+
+    # Nonexistent table should return query_failed (OperationalError)
+    res_missing_table = execute_guarded_query(database, "SELECT * FROM nonexistent_table_xyz")
+    assert res_missing_table["ok"] is False
+    assert res_missing_table["code"] == "query_failed"
+
+    # Comment-only query should return invalid_input
+    res_comment = execute_guarded_query(database, "-- this is only a comment\n/* block */")
+    assert res_comment["ok"] is False
+    assert res_comment["code"] == "invalid_input"
+
+    # Invalid max_vm_steps should return invalid_limit
+    res_vm = execute_guarded_query(database, "SELECT 1", max_vm_steps=500)
+    assert res_vm["ok"] is False
+    assert res_vm["code"] == "invalid_limit"
+
+
+def test_query_plan_diagnostics(database: Path) -> None:
+    # Test query using index
+    res_idx = explain_query(database, "SELECT name FROM people WHERE email = 'test'")
+    assert res_idx["ok"] is True
+    assert "diagnostics" in res_idx
+    diag_idx = res_idx["diagnostics"]
+    assert diag_idx["uses_index"] is True
+    assert "idx_people_email" in diag_idx["indexes_used"]
+    assert len(diag_idx["recommendations"]) > 0
+
+    # Test full table scan
+    res_scan = explain_query(database, "SELECT name FROM people WHERE name = 'Alice'")
+    assert res_scan["ok"] is True
+    diag_scan = res_scan["diagnostics"]
+    assert diag_scan["scans_table"] is True
+    assert "people" in diag_scan["scanned_tables"]
+    assert any("Full table scan" in r for r in diag_scan["recommendations"])
+
+    # Test temporary sorting
+    res_sort = explain_query(database, "SELECT name FROM people ORDER BY name")
+    assert res_sort["ok"] is True
+    assert res_sort["diagnostics"]["uses_temp_btree"] is True
+
+
+def test_describe_table_relationships_and_truncation(database: Path) -> None:
+    with open_test_connection(database) as conn:
+        conn.execute(
+            """
+            CREATE TABLE orders (
+                order_id INTEGER PRIMARY KEY,
+                user_id INTEGER,
+                amount REAL,
+                FOREIGN KEY(user_id) REFERENCES people(id) ON UPDATE CASCADE ON DELETE SET NULL
+            )
+            """
+        )
+
+    desc = describe_table(database, "orders")
+    assert desc["ok"] is True
+    assert desc["truncated"] is False
+    assert desc["columns_truncated"] is False
+    assert desc["indexes_truncated"] is False
+    assert desc["foreign_keys_truncated"] is False
+    assert len(desc["relationships"]) == 1
+    rel = desc["relationships"][0]
+    assert rel["from_column"] == "user_id"
+    assert rel["target_table"] == "people"
+    assert rel["target_column"] == "id"
+    assert rel["on_update"] == "CASCADE"
+    assert rel["on_delete"] == "SET NULL"
+
+
+def test_inspect_schema_summary_architecture(database: Path) -> None:
+    # Direct function call
+    summary = inspect_schema_summary(database)
+    assert summary["ok"] is True
+    assert summary["table_count"] >= 1
+    assert "people" in summary["tables"]
+    assert summary["truncated"] is False
+
+    # Add a second table to test table cap truncation
+    with open_test_connection(database) as conn:
+        conn.execute("CREATE TABLE extra_table (id INTEGER PRIMARY KEY);")
+
+    # Test max_tables cap truncation
+    summary_trunc = inspect_schema_summary(database, max_tables=1)
+    assert summary_trunc["ok"] is True
+    assert summary_trunc["table_count"] == 1
+    assert summary_trunc["truncated"] is True
+    assert "capped at 1" in summary_trunc["warning"]
+
+    # Test timeout truncation
+    summary_timeout = inspect_schema_summary(database, timeout_seconds=0.0)
+    assert summary_timeout["ok"] is True
+    assert summary_timeout["truncated"] is True
+
+
+@pytest.mark.anyio
+async def test_real_stdio_subprocess_transport(database: Path) -> None:
+    import sys
+
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "sqlite_guard_mcp", "--db", str(database)],
+    )
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            init = await session.initialize()
+            assert init.server_info.name == "sqlite-guard-mcp"
+
+            tools = await session.list_tools()
+            tool_names = [t.name for t in tools.tools]
+            assert "read_query" in tool_names
+            assert "describe_database_table" in tool_names
+
+            query_res = await session.call_tool(
+                "read_query",
+                {"sql": "SELECT name, password FROM people WHERE id = 1"},
+            )
+            data = json.loads(query_res.content[0].text)
+            assert data["ok"] is True
+            assert data["rows"][0]["name"] == "Alice"
+            assert data["rows"][0]["password"] is None
+
+
+@pytest.mark.anyio
+async def test_real_streamable_http_transport(database: Path) -> None:
+    import socket
+
+    import anyio
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    sock = socket.socket()
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    server = create_server(database)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            lambda: server.run_streamable_http_async(
+                host="127.0.0.1",
+                port=port,
+                streamable_http_path="/mcp",
+            )
+        )
+        await anyio.sleep(0.5)
+
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (read, write):
+            async with ClientSession(read, write) as session:
+                init = await session.initialize()
+                assert init.server_info.name == "sqlite-guard-mcp"
+
+                tools = await session.list_tools()
+                assert any(t.name == "read_query" for t in tools.tools)
+
+                res = await session.call_tool(
+                    "read_query",
+                    {"sql": "SELECT name FROM people WHERE id = 2"},
+                )
+                data = json.loads(res.content[0].text)
+                assert data["ok"] is True
+                assert data["rows"][0]["name"] == "Bob"
+
+        tg.cancel_scope.cancel()
+
+
+def test_cli_host_and_port_options(database: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from sqlite_guard_mcp.server import main
+
+    captured = {}
+
+    class MockServer:
+        def run(self, transport="stdio", **kwargs):
+            captured["transport"] = transport
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "sqlite_guard_mcp.server.create_server",
+        lambda *args, **kwargs: MockServer(),
+    )
+
+    exit_code = main(
+        [
+            "--db",
+            str(database),
+            "--transport",
+            "streamable-http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8888",
+        ]
+    )
+    assert exit_code == 0
+    assert captured["transport"] == "streamable-http"
+    assert captured["kwargs"] == {"host": "0.0.0.0", "port": 8888}
+
+    exit_code_sse = main(
+        [
+            "--db",
+            str(database),
+            "--transport",
+            "sse",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9000",
+        ]
+    )
+    assert exit_code_sse == 0
+    assert captured["transport"] == "sse"
+    assert captured["kwargs"] == {"host": "127.0.0.1", "port": 9000}
+
+
+def test_comprehensive_resource_lifecycle(database: Path) -> None:
+    # 1. Successful query
+    assert execute_guarded_query(database, "SELECT 1")["ok"] is True
+
+    # 2. ProgrammingError (multi-statement)
+    assert execute_guarded_query(database, "SELECT 1; SELECT 2")["ok"] is False
+
+    # 3. OperationalError (syntax error)
+    assert execute_guarded_query(database, "SELECT FROM")["ok"] is False
+
+    # 4. Authorizer block
+    assert execute_guarded_query(database, "PRAGMA database_list")["ok"] is False
+
+    # 5. Schema summary
+    assert inspect_schema_summary(database)["ok"] is True
+
+    # 6. Describe table
+    assert describe_table(database, "people")["ok"] is True
+
+    # 7. Explain query
+    assert explain_query(database, "SELECT * FROM people")["ok"] is True
