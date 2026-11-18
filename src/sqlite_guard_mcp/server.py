@@ -27,6 +27,9 @@ MAX_RESULT_BYTES = 1_000_000
 SQLITE_INT64_MIN = -9_223_372_036_854_775_808
 SQLITE_INT64_MAX = 9_223_372_036_854_775_807
 MAX_SCHEMA_TABLES = 500
+MAX_INDEXES = 100
+MAX_INDEX_COLUMNS = 50
+MAX_FOREIGN_KEYS = 100
 
 DEFAULT_MAX_ROWS = 250
 DEFAULT_TIMEOUT_SECONDS = 2.0
@@ -698,6 +701,63 @@ def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+def _analyze_indexes_for_table(
+    columns: list[dict[str, Any]],
+    indexes: list[dict[str, Any]],
+    foreign_keys: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Provide deterministic index intelligence and optimization recommendations."""
+    recommendations: list[str] = []
+    unindexed_fks: list[str] = []
+
+    indexed_leading_columns = set()
+    index_column_signatures: list[tuple[str, tuple[str, ...]]] = []
+
+    for idx in indexes:
+        idx_cols = [str(c.get("name", "")) for c in idx.get("columns", []) if c.get("name")]
+        if idx_cols:
+            indexed_leading_columns.add(idx_cols[0])
+            index_column_signatures.append((str(idx.get("name", "")), tuple(idx_cols)))
+
+    for fk in foreign_keys:
+        from_col = fk.get("from")
+        if from_col and from_col not in indexed_leading_columns:
+            is_pk = any(col.get("name") == from_col and col.get("pk") for col in columns)
+            if not is_pk:
+                unindexed_fks.append(str(from_col))
+                recommendations.append(
+                    f"Foreign key column '{from_col}' lacks a supporting index with leading "
+                    f"column '{from_col}'. Adding an index on '{from_col}' can improve JOIN "
+                    "performance and referential integrity checks."
+                )
+
+    for i in range(len(index_column_signatures)):
+        for j in range(i + 1, len(index_column_signatures)):
+            name1, cols1 = index_column_signatures[i]
+            name2, cols2 = index_column_signatures[j]
+            if cols1 == cols2:
+                recommendations.append(
+                    f"Duplicate indexes detected: '{name1}' and '{name2}' index the same columns."
+                )
+            else:
+                shorter, longer = (cols1, cols2) if len(cols1) <= len(cols2) else (cols2, cols1)
+                short_name, long_name = (
+                    (name1, name2) if len(cols1) <= len(cols2) else (name2, name1)
+                )
+                if len(shorter) < len(longer) and longer[: len(shorter)] == shorter:
+                    short_str = ", ".join(shorter)
+                    long_str = ", ".join(longer)
+                    recommendations.append(
+                        f"Index '{short_name}' ({short_str}) is a prefix of composite index "
+                        f"'{long_name}' ({long_str})."
+                    )
+
+    return {
+        "recommendations": recommendations,
+        "unindexed_foreign_keys": unindexed_fks,
+    }
+
+
 def describe_table(
     db_path: str | Path,
     table_name: str,
@@ -706,9 +766,23 @@ def describe_table(
     max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
 ) -> dict[str, Any]:
     """Return table columns, indexes, foreign keys, and masking metadata."""
+    if not isinstance(table_name, str) or not table_name.strip():
+        return _error("table_name must be a non-empty string.", "invalid_table_name")
+
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 0
+    ):
+        return _error("timeout_seconds must be a non-negative number.", "invalid_input")
+    if timeout_seconds > 300:
+        return _error("timeout_seconds exceeds maximum allowed limit (300).", "invalid_input")
+
+    if isinstance(max_vm_steps, bool) or not isinstance(max_vm_steps, int) or max_vm_steps <= 0:
+        return _error("max_vm_steps must be a positive integer.", "invalid_input")
+
     try:
         quoted_table = _quote_identifier(table_name)
-
     except ValueError as exc:
         return _error(str(exc), "invalid_table_name")
 
@@ -718,13 +792,11 @@ def describe_table(
             timeout_seconds=timeout_seconds,
             max_vm_steps=max_vm_steps,
         )
-
     except FileNotFoundError:
         return _error(
             "Database file was not found or is not a regular file.",
             "database_not_found",
         )
-
     except (sqlite3.Error, OSError, RuntimeError):
         return _error(
             "Could not open the database in read-only mode.",
@@ -740,14 +812,16 @@ def describe_table(
             finally:
                 cur.close()
 
-        raw_columns = _fetch_rows(f"PRAGMA table_xinfo({quoted_table})")[:MAX_COLUMNS]
-        columns = [dict(row) for row in raw_columns]
-
-        if not columns:
+        raw_columns_all = _fetch_rows(f"PRAGMA table_xinfo({quoted_table})")
+        if not raw_columns_all:
             return _error(
                 "The requested table or view does not exist.",
                 "table_not_found",
             )
+
+        columns_truncated = len(raw_columns_all) > MAX_COLUMNS
+        raw_columns = raw_columns_all[:MAX_COLUMNS]
+        columns = [dict(row) for row in raw_columns]
 
         for column in columns:
             col_name = str(column.get("name", ""))
@@ -760,23 +834,24 @@ def describe_table(
                 column["default_redacted"] = False
 
         indexes = []
-
-        raw_indexes = _fetch_rows(f"PRAGMA index_list({quoted_table})")[:MAX_COLUMNS]
+        raw_indexes_all = _fetch_rows(f"PRAGMA index_list({quoted_table})")
+        indexes_truncated = len(raw_indexes_all) > MAX_INDEXES
+        raw_indexes = raw_indexes_all[:MAX_INDEXES]
+        index_columns_truncated = False
 
         for index in raw_indexes:
             item = dict(index)
             quoted_index = _quote_identifier(str(item["name"]))
-
-            item["columns"] = [
-                dict(row) for row in _fetch_rows(f"PRAGMA index_xinfo({quoted_index})")
-            ]
-
+            raw_idx_cols_all = _fetch_rows(f"PRAGMA index_xinfo({quoted_index})")
+            if len(raw_idx_cols_all) > MAX_INDEX_COLUMNS:
+                index_columns_truncated = True
+            item["columns"] = [dict(row) for row in raw_idx_cols_all[:MAX_INDEX_COLUMNS]]
             indexes.append(item)
 
-        foreign_keys = [
-            dict(row)
-            for row in _fetch_rows(f"PRAGMA foreign_key_list({quoted_table})")[:MAX_COLUMNS]
-        ]
+        raw_fks_all = _fetch_rows(f"PRAGMA foreign_key_list({quoted_table})")
+        foreign_keys_truncated = len(raw_fks_all) > MAX_FOREIGN_KEYS
+        raw_fks = raw_fks_all[:MAX_FOREIGN_KEYS]
+        foreign_keys = [dict(row) for row in raw_fks]
 
         relationships = [
             {
@@ -790,29 +865,48 @@ def describe_table(
             if fk.get("from") and fk.get("table")
         ]
 
-        columns_truncated = len(raw_columns) == MAX_COLUMNS
-        indexes_truncated = len(raw_indexes) == MAX_COLUMNS
-        foreign_keys_truncated = len(foreign_keys) == MAX_COLUMNS
+        index_intelligence = _analyze_indexes_for_table(columns, indexes, foreign_keys)
+        warnings: list[str] = []
 
-        return {
+        payload: dict[str, Any] = {
             "ok": True,
             "table": table_name,
             "columns": columns,
             "indexes": indexes,
             "foreign_keys": foreign_keys,
             "relationships": relationships,
-            "truncated": columns_truncated or indexes_truncated or foreign_keys_truncated,
+            "index_intelligence": index_intelligence,
+            "truncated": (
+                columns_truncated
+                or indexes_truncated
+                or index_columns_truncated
+                or foreign_keys_truncated
+            ),
             "columns_truncated": columns_truncated,
             "indexes_truncated": indexes_truncated,
+            "index_columns_truncated": index_columns_truncated,
             "foreign_keys_truncated": foreign_keys_truncated,
+            "response_truncated": False,
+            "warnings": warnings,
         }
+
+        if _serialized_size(payload) > MAX_RESULT_BYTES:
+            payload["response_truncated"] = True
+            payload["truncated"] = True
+            warnings.append("Schema metadata response exceeded byte budget and was truncated.")
+            for idx in payload["indexes"]:
+                idx["columns"] = idx["columns"][:2]
+            if _serialized_size(payload) > MAX_RESULT_BYTES:
+                payload["relationships"] = []
+                payload["indexes"] = payload["indexes"][:10]
+
+        return payload
 
     except sqlite3.Error:
         return _error(
             "SQLite could not inspect this table's schema.",
             "schema_inspection_failed",
         )
-
     finally:
         connection.close()
 
@@ -821,30 +915,51 @@ def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Provide structured, evidence-based diagnostics for an EXPLAIN QUERY PLAN."""
     uses_index = False
     scans_table = False
+    covering_index_detected = False
     indexes_used: list[str] = []
     scanned_tables: list[str] = []
     temp_btree = False
     recommendations: list[str] = []
 
     for row in rows:
-        detail = str(row.get("detail", ""))
+        detail = str(row.get("detail", "")).strip()
+        detail_upper = detail.upper()
 
-        idx_match = re.search(r"USING (?:COVERING )?INDEX (\w+)", detail)
-        if idx_match:
-            uses_index = True
-            indexes_used.append(idx_match.group(1))
-        elif "USING INTEGER PRIMARY KEY" in detail:
-            uses_index = True
-
-        scan_match = re.search(r"SCAN (?:TABLE )?(\w+)", detail)
-        if scan_match:
-            scans_table = True
-            tbl = scan_match.group(1)
-            if tbl not in scanned_tables and not tbl.startswith("sqlite_"):
-                scanned_tables.append(tbl)
-
-        if "USE TEMP B-TREE" in detail:
+        if "USE TEMP B-TREE" in detail_upper:
             temp_btree = True
+
+        if detail_upper.startswith("SEARCH "):
+            uses_index = True
+            rest = detail[7:].strip()
+            if rest.upper().startswith("TABLE "):
+                rest = rest[6:].strip()
+            parts = re.split(r"\s+USING\s+", rest, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                using_part = parts[1].strip()
+                if using_part.upper().startswith("COVERING INDEX "):
+                    covering_index_detected = True
+                    idx_name = using_part[15:].split("(", 1)[0].strip().strip('"[]`')
+                    if idx_name:
+                        indexes_used.append(idx_name)
+                elif using_part.upper().startswith("INDEX "):
+                    idx_name = using_part[6:].split("(", 1)[0].strip().strip('"[]`')
+                    if idx_name:
+                        indexes_used.append(idx_name)
+        elif "USING INTEGER PRIMARY KEY" in detail_upper:
+            uses_index = True
+
+        if detail_upper.startswith("SCAN "):
+            scans_table = True
+            rest = detail[5:].strip()
+            if rest.upper().startswith("TABLE "):
+                rest = rest[6:].strip()
+            tbl = (
+                re.split(r"\s+AS\s+|\s+USING\s+", rest, flags=re.IGNORECASE)[0]
+                .strip()
+                .strip('"[]`')
+            )
+            if tbl and tbl not in scanned_tables and not tbl.startswith("sqlite_"):
+                scanned_tables.append(tbl)
 
     if scans_table and scanned_tables:
         for tbl in scanned_tables:
@@ -860,12 +975,21 @@ def _analyze_query_plan(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not recommendations and uses_index:
         recommendations.append("Query is efficiently utilizing available indexes.")
 
+    observations = {
+        "full_scan_detected": scans_table,
+        "index_search_detected": uses_index,
+        "covering_index_detected": covering_index_detected,
+        "temporary_sort_detected": temp_btree,
+    }
+
     return {
         "uses_index": uses_index,
         "scans_table": scans_table,
         "indexes_used": list(dict.fromkeys(indexes_used)),
         "scanned_tables": scanned_tables,
         "uses_temp_btree": temp_btree,
+        "observations": observations,
+        "confidence": "high" if rows else "heuristic",
         "recommendations": recommendations,
     }
 
@@ -909,6 +1033,34 @@ def inspect_schema_summary(
     max_columns_per_table: int = MAX_COLUMNS,
 ) -> dict[str, Any]:
     """Provide a single-connection bounded summary of all tables, views, and schemas."""
+    if isinstance(max_tables, bool) or not isinstance(max_tables, int) or max_tables <= 0:
+        return _error("max_tables must be a positive integer.", "invalid_input")
+    if max_tables > 10_000:
+        return _error("max_tables exceeds maximum allowed limit (10000).", "invalid_input")
+
+    if (
+        isinstance(max_columns_per_table, bool)
+        or not isinstance(max_columns_per_table, int)
+        or max_columns_per_table <= 0
+    ):
+        return _error("max_columns_per_table must be a positive integer.", "invalid_input")
+    if max_columns_per_table > 1_000:
+        return _error(
+            "max_columns_per_table exceeds maximum allowed limit (1000).", "invalid_input"
+        )
+
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 0
+    ):
+        return _error("timeout_seconds must be a non-negative number.", "invalid_input")
+    if timeout_seconds > 300:
+        return _error("timeout_seconds exceeds maximum allowed limit (300).", "invalid_input")
+
+    if isinstance(max_vm_steps, bool) or not isinstance(max_vm_steps, int) or max_vm_steps <= 0:
+        return _error("max_vm_steps must be a positive integer.", "invalid_input")
+
     try:
         connection = _open_connection(
             db_path,
@@ -929,7 +1081,11 @@ def inspect_schema_summary(
     started = time.monotonic()
     tables_dict: dict[str, Any] = {}
     truncated = False
-    warning = None
+    tables_truncated = False
+    columns_truncated = False
+    time_truncated = False
+    response_truncated = False
+    warnings: list[dict[str, Any]] = []
 
     try:
 
@@ -940,27 +1096,46 @@ def inspect_schema_summary(
             finally:
                 cur.close()
 
+        count_rows = _fetch_rows(
+            "SELECT count(*) AS cnt FROM sqlite_schema "
+            "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'"
+        )
+        total_tables = int(count_rows[0]["cnt"]) if count_rows else 0
+
         table_rows = _fetch_rows(
             "SELECT name, type FROM sqlite_schema "
-            "WHERE type IN ('table', 'view') "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name LIMIT ?",
+            (max_tables,),
         )
-        total_tables = len(table_rows)
 
         if total_tables > max_tables:
             truncated = True
-            warning = (
-                f"Database contains {total_tables} tables/views; summary capped at {max_tables}."
+            tables_truncated = True
+            warnings.append(
+                {
+                    "code": "table_count_capped",
+                    "object": None,
+                    "message": (
+                        f"Database contains {total_tables} tables/views; "
+                        f"summary capped at {max_tables}."
+                    ),
+                }
             )
-            selected_tables = table_rows[:max_tables]
-        else:
-            selected_tables = table_rows
 
-        for row in selected_tables:
+        for row in table_rows:
             if (time.monotonic() - started) >= timeout_seconds:
                 truncated = True
-                warning = (
-                    f"Schema summary timed out after {timeout_seconds}s and was partially returned."
+                time_truncated = True
+                warnings.append(
+                    {
+                        "code": "timeout_reached",
+                        "object": None,
+                        "message": (
+                            f"Schema summary timed out after {timeout_seconds}s and "
+                            "was partially returned."
+                        ),
+                    }
                 )
                 break
 
@@ -969,10 +1144,30 @@ def inspect_schema_summary(
 
             try:
                 quoted = _quote_identifier(tbl_name)
-                raw_cols = _fetch_rows(f"PRAGMA table_xinfo({quoted})")[:max_columns_per_table]
-            except Exception:
+                raw_cols_all = _fetch_rows(f"PRAGMA table_xinfo({quoted})")
+            except Exception as exc:
+                truncated = True
+                warnings.append(
+                    {
+                        "code": "schema_object_inspection_failed",
+                        "object": tbl_name,
+                        "message": (
+                            f"Could not inspect table_xinfo for '{tbl_name}': {type(exc).__name__}"
+                        ),
+                    }
+                )
+                tables_dict[tbl_name] = {
+                    "type": tbl_type,
+                    "status": "inspection_failed",
+                    "columns": [],
+                }
                 continue
 
+            if len(raw_cols_all) > max_columns_per_table:
+                columns_truncated = True
+                truncated = True
+
+            raw_cols = raw_cols_all[:max_columns_per_table]
             columns = []
             for col in raw_cols:
                 c_name = str(col["name"])
@@ -987,29 +1182,84 @@ def inspect_schema_summary(
                     }
                 )
 
+            table_indexes = []
+            try:
+                raw_idx = _fetch_rows(f"PRAGMA index_list({quoted})")[:20]
+                for idx in raw_idx:
+                    table_indexes.append(
+                        {
+                            "name": str(idx["name"]),
+                            "unique": bool(idx["unique"]),
+                        }
+                    )
+            except Exception:
+                pass
+
+            table_relationships = []
+            try:
+                raw_fks = _fetch_rows(f"PRAGMA foreign_key_list({quoted})")[:20]
+                for fk in raw_fks:
+                    if fk.get("from") and fk.get("table"):
+                        table_relationships.append(
+                            {
+                                "from_column": fk.get("from"),
+                                "target_table": fk.get("table"),
+                                "target_column": fk.get("to"),
+                            }
+                        )
+            except Exception:
+                pass
+
             tables_dict[tbl_name] = {
                 "type": tbl_type,
                 "columns": columns,
+                "indexes": table_indexes,
+                "relationships": table_relationships,
             }
 
         elapsed = round((time.monotonic() - started) * 1000, 3)
+        status = (
+            "complete"
+            if not truncated
+            and not any(w["code"] == "schema_object_inspection_failed" for w in warnings)
+            else "partial"
+        )
+        warning_str = "; ".join(w["message"] for w in warnings) if warnings else None
 
         payload: dict[str, Any] = {
             "ok": True,
+            "status": status,
             "tables": tables_dict,
             "table_count": len(tables_dict),
             "total_tables": total_tables,
             "truncated": truncated,
+            "tables_truncated": tables_truncated,
+            "columns_truncated": columns_truncated,
+            "time_truncated": time_truncated,
+            "response_truncated": response_truncated,
             "elapsed_ms": elapsed,
+            "warnings": warnings,
         }
-        if warning:
-            payload["warning"] = warning
+        if warning_str:
+            payload["warning"] = warning_str
 
         while tables_dict and _serialized_size(payload) > MAX_RESULT_BYTES:
             last_key = next(reversed(tables_dict))
             del tables_dict[last_key]
             payload["table_count"] = len(tables_dict)
             payload["truncated"] = True
+            payload["response_truncated"] = True
+            payload["status"] = "partial"
+            if not any(w.get("code") == "response_size_truncated" for w in warnings):
+                warnings.append(
+                    {
+                        "code": "response_size_truncated",
+                        "object": None,
+                        "message": (
+                            "Schema summary exceeded maximum response size and was truncated."
+                        ),
+                    }
+                )
             payload["warning"] = "Schema summary exceeded maximum response size and was truncated."
 
         return payload

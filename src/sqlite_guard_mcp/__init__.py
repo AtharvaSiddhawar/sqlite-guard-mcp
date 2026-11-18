@@ -19,6 +19,7 @@ from .server import (
     describe_table,
     execute_guarded_query,
     explain_query,
+    inspect_schema_summary,
     list_tables,
     main,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "describe_table",
     "execute_guarded_query",
     "explain_query",
+    "inspect_schema_summary",
     "list_tables",
     "main",
 ]

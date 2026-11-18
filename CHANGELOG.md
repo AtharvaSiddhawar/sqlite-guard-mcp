@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Integer Parameter Range Validation**: Validates that all integer query parameters strictly fit within SQLite's signed 64-bit integer range (`-9223372036854775808` to `9223372036854775807`), returning structured `invalid_input` errors instead of uncaught `OverflowError`.
-- **Query Plan Diagnostics**: `explain_read_query` now automatically performs deterministic query plan analysis, extracting table scans, index lookups, temporary B-tree sorting, and providing actionable optimization recommendations.
-- **Foreign Key Relationship Discovery**: `describe_database_table` now includes resolved `relationships` metadata with referenced tables, columns, and update/delete actions.
-- **Truncation Metadata**: Schema inspection operations now provide explicit truncation flags (`truncated`, `columns_truncated`, `indexes_truncated`, `foreign_keys_truncated`) and descriptive warnings.
-- **Single-Connection Schema Summary**: Refactored `schema://summary` to use `inspect_schema_summary`, reusing a single read-only inspection connection with global timeouts and table caps (`MAX_SCHEMA_TABLES = 500`).
+- **Query Plan Diagnostics & Observability**: `explain_read_query` performs deterministic query plan analysis supporting spaces, quotes, and aliases in table/index names. Exposes structured `observations` (`full_scan_detected`, `index_search_detected`, `covering_index_detected`, `temporary_sort_detected`) and confidence levels.
+- **Index Intelligence**: `describe_database_table` analyzes indexes to detect unindexed foreign keys and overlapping/duplicate composite index definitions with evidence-based recommendations.
+- **Foreign Key Relationship Discovery**: `describe_database_table` includes resolved `relationships` metadata with referenced tables, columns, and update/delete actions.
+- **Accurate Truncation Metadata**: Implemented limit-plus-one metadata retrieval distinguishing collections exactly at limits from truncated collections. Exposes explicit flags (`truncated`, `tables_truncated`, `columns_truncated`, `indexes_truncated`, `foreign_keys_truncated`, `response_truncated`, `time_truncated`).
+- **Resilient Partial-Status Schema Summaries**: Refactored `schema://summary` to use bounded SQL queries and record structured warnings for uninspectable objects while preserving valid metadata with clear `status: "complete"` or `"partial"` reporting.
+- **Clean Socket Lifecycle**: Graceful server shutdown in HTTP transport integration tests eliminating unclosed socket warnings.
 - **Comprehensive Transport Testing**: Real integration tests covering `stdio` subprocess transport and `streamable-http` client transport.
 - **CLI Options**: Added `--host` and `--port` CLI options for HTTP transport configuration.
 

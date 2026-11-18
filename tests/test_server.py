@@ -1151,6 +1151,7 @@ async def test_real_streamable_http_transport(database: Path) -> None:
     import socket
 
     import anyio
+    import uvicorn
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
 
@@ -1160,34 +1161,33 @@ async def test_real_streamable_http_transport(database: Path) -> None:
     sock.close()
 
     server = create_server(database)
+    starlette_app = server.streamable_http_app(streamable_http_path="/mcp")
+    config = uvicorn.Config(starlette_app, host="127.0.0.1", port=port, log_level="warning")
+    u_server = uvicorn.Server(config)
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(
-            lambda: server.run_streamable_http_async(
-                host="127.0.0.1",
-                port=port,
-                streamable_http_path="/mcp",
-            )
-        )
-        await anyio.sleep(0.5)
+        tg.start_soon(u_server.serve)
+        while not u_server.started:
+            await anyio.sleep(0.05)
 
-        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (read, write):
-            async with ClientSession(read, write) as session:
-                init = await session.initialize()
-                assert init.server_info.name == "sqlite-guard-mcp"
+        try:
+            async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (read, write):
+                async with ClientSession(read, write) as session:
+                    init = await session.initialize()
+                    assert init.server_info.name == "sqlite-guard-mcp"
 
-                tools = await session.list_tools()
-                assert any(t.name == "read_query" for t in tools.tools)
+                    tools = await session.list_tools()
+                    assert any(t.name == "read_query" for t in tools.tools)
 
-                res = await session.call_tool(
-                    "read_query",
-                    {"sql": "SELECT name FROM people WHERE id = 2"},
-                )
-                data = json.loads(res.content[0].text)
-                assert data["ok"] is True
-                assert data["rows"][0]["name"] == "Bob"
-
-        tg.cancel_scope.cancel()
+                    res = await session.call_tool(
+                        "read_query",
+                        {"sql": "SELECT name FROM people WHERE id = 2"},
+                    )
+                    data = json.loads(res.content[0].text)
+                    assert data["ok"] is True
+                    assert data["rows"][0]["name"] == "Bob"
+        finally:
+            u_server.should_exit = True
 
 
 def test_cli_host_and_port_options(database: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1259,3 +1259,162 @@ def test_comprehensive_resource_lifecycle(database: Path) -> None:
 
     # 7. Explain query
     assert explain_query(database, "SELECT * FROM people")["ok"] is True
+
+
+def test_schema_inspection_argument_validation(database: Path) -> None:
+    # Invalid table_name
+    assert describe_table(database, "")["code"] == "invalid_table_name"
+    assert describe_table(database, "   ")["code"] == "invalid_table_name"
+    assert describe_table(database, 123)["code"] == "invalid_table_name"  # type: ignore
+
+    # Invalid timeout
+    assert describe_table(database, "people", timeout_seconds=-1)["code"] == "invalid_input"
+    assert describe_table(database, "people", timeout_seconds=999)["code"] == "invalid_input"
+    assert describe_table(database, "people", timeout_seconds=True)["code"] == "invalid_input"  # type: ignore
+
+    # Invalid max_vm_steps
+    assert describe_table(database, "people", max_vm_steps=-5)["code"] == "invalid_input"
+    assert describe_table(database, "people", max_vm_steps=True)["code"] == "invalid_input"  # type: ignore
+
+    # Invalid inspect_schema_summary arguments
+    assert inspect_schema_summary(database, max_tables=0)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, max_tables=-1)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, max_tables=True)["code"] == "invalid_input"  # type: ignore
+    assert inspect_schema_summary(database, max_tables=99999)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, max_columns_per_table=0)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, max_columns_per_table=9999)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, timeout_seconds=-0.5)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, timeout_seconds=1000)["code"] == "invalid_input"
+    assert inspect_schema_summary(database, max_vm_steps=0)["code"] == "invalid_input"
+
+
+def test_describe_table_index_intelligence_and_overlapping(database: Path) -> None:
+    with open_test_connection(database) as conn:
+        conn.execute(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                customer_id INTEGER NOT NULL,
+                order_date TEXT NOT NULL,
+                total REAL NOT NULL,
+                FOREIGN KEY(customer_id) REFERENCES people(id)
+            );
+            """
+        )
+        # Duplicate/overlapping indexes on orders
+        conn.execute("CREATE INDEX idx_orders_date ON orders(order_date);")
+        conn.execute("CREATE INDEX idx_orders_date_total ON orders(order_date, total);")
+
+    desc = describe_table(database, "orders")
+    assert desc["ok"] is True
+    intel = desc["index_intelligence"]
+    assert "customer_id" in intel["unindexed_foreign_keys"]
+    assert any("Foreign key column 'customer_id'" in r for r in intel["recommendations"])
+    assert any("prefix of composite index" in r for r in intel["recommendations"])
+
+
+def test_query_plan_diagnostic_observations_and_quoted_identifiers(database: Path) -> None:
+    with open_test_connection(database) as conn:
+        conn.execute(
+            'CREATE TABLE "order items" (id INTEGER PRIMARY KEY, item_name TEXT NOT NULL);'
+        )
+        conn.execute('CREATE INDEX "idx_item_name" ON "order items"(item_name);')
+
+    # Query with quoted identifier and full table scan
+    res = explain_query(database, 'SELECT * FROM "order items"')
+    assert res["ok"] is True
+    diag = res["diagnostics"]
+    assert diag["scans_table"] is True
+    assert diag["observations"]["full_scan_detected"] is True
+    assert "order items" in diag["scanned_tables"]
+
+    # Query utilizing covering index
+    res_idx = explain_query(
+        database, 'SELECT item_name FROM "order items" WHERE item_name = ?', ["widget"]
+    )
+    assert res_idx["ok"] is True
+    diag_idx = res_idx["diagnostics"]
+    assert diag_idx["uses_index"] is True
+    assert diag_idx["observations"]["index_search_detected"] is True
+    assert "idx_item_name" in diag_idx["indexes_used"]
+
+
+def test_schema_summary_partial_status_and_complete_status(tmp_path: Path) -> None:
+    db = tmp_path / "test_partial.sqlite"
+    with open_test_connection(db) as conn:
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY);")
+        conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY);")
+
+    # Complete summary
+    summary = inspect_schema_summary(db)
+    assert summary["ok"] is True
+    assert summary["status"] == "complete"
+    assert summary["table_count"] == 2
+    assert summary["truncated"] is False
+    assert len(summary["warnings"]) == 0
+
+    # Partial summary via max_tables cap
+    summary_part = inspect_schema_summary(db, max_tables=1)
+    assert summary_part["ok"] is True
+    assert summary_part["status"] == "partial"
+    assert summary_part["table_count"] == 1
+    assert summary_part["truncated"] is True
+    assert summary_part["tables_truncated"] is True
+    assert any(w["code"] == "table_count_capped" for w in summary_part["warnings"])
+
+
+def test_describe_table_truncation_and_byte_budget(
+    database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_COLUMNS", 2)
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_INDEXES", 1)
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_FOREIGN_KEYS", 1)
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_INDEX_COLUMNS", 1)
+
+    desc = describe_table(database, "people")
+    assert desc["ok"] is True
+    assert desc["columns_truncated"] is True
+    assert desc["truncated"] is True
+
+    # Test byte budget truncation
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_RESULT_BYTES", 300)
+    desc_bytes = describe_table(database, "people")
+    assert desc_bytes["ok"] is True
+    assert desc_bytes["response_truncated"] is True
+
+
+def test_schema_summary_byte_budget_and_object_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "broken_view.sqlite"
+    with open_test_connection(db) as conn:
+        conn.execute("CREATE TABLE t_temp (id INT);")
+        conn.execute("CREATE VIEW v_broken AS SELECT * FROM t_temp;")
+        conn.execute("DROP TABLE t_temp;")
+
+    # When inspecting v_broken, table_xinfo fails because t_temp is missing
+    res_fail = inspect_schema_summary(db)
+    assert res_fail["ok"] is True
+    assert res_fail["status"] == "partial"
+    assert any(w["code"] == "schema_object_inspection_failed" for w in res_fail["warnings"])
+
+    # Test response size truncation in inspect_schema_summary
+    monkeypatch.setattr("sqlite_guard_mcp.server.MAX_RESULT_BYTES", 400)
+    res = inspect_schema_summary(db)
+    assert res["ok"] is True
+    assert res["response_truncated"] is True
+    assert res["truncated"] is True
+
+
+def test_duplicate_indexes_detection(tmp_path: Path) -> None:
+    db = tmp_path / "dup_idx.sqlite"
+    with open_test_connection(db) as conn:
+        conn.execute("CREATE TABLE items (id INT, code TEXT);")
+        conn.execute("CREATE INDEX idx1 ON items(code);")
+        conn.execute("CREATE INDEX idx2 ON items(code);")
+
+    desc = describe_table(db, "items")
+    assert desc["ok"] is True
+    assert any(
+        "Duplicate indexes detected" in r for r in desc["index_intelligence"]["recommendations"]
+    )
