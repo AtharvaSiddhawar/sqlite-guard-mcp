@@ -68,7 +68,7 @@ As autonomous AI agents (Claude Code, Cursor, Copilot Workspace, OpenAI Operator
 
 ## 3. Competitive Comparison Matrix
 
-| Capability / Feature | SQLite Guard MCP (v0.2.1) | Bytebase DBHub | Google MCP Toolbox | Rust SQLite MCP | npm mcp-sqlite |
+| Capability / Feature | SQLite Guard MCP (v0.2.2) | Bytebase DBHub | Google MCP Toolbox | Rust SQLite MCP | npm mcp-sqlite |
 |---|:---:|:---:|:---:|:---:|:---:|
 | **Language & Ecosystem** | Python 3.11+ / MCP SDK 2.x | Go / Docker | Go / Cloud Native | Rust (Native) | Node.js (npx) |
 | **Native SQLite Authorizer** | **Yes (Bytecode Level)** | No | No | **Yes** | No |

@@ -3,7 +3,7 @@
 A read-only, security-hardened SQLite MCP server for AI agents.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 from .policy import (
     AccessPolicy,
@@ -20,9 +20,6 @@ from .server import (
     MAX_PARAM_KEY_LENGTH,
     MAX_PARAMS_COUNT,
     MAX_PARAMS_TOTAL_BYTES,
-    MAX_PARAMS_COUNT,
-    MAX_PARAMS_TOTAL_BYTES,
-    MAX_PARAM_KEY_LENGTH,
     MAX_RESULT_BYTES,
     MAX_ROWS_HARD_LIMIT,
     MAX_SQL_LENGTH,

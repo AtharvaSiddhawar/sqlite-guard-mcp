@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] - Unreleased
+## [0.2.2] - 2026-11-23
 
 ### Added
 - **Fail-Closed Access Policy Engine**: Introduced `policy.py` supporting fine-grained TOML access configuration with table and column allow & deny rules, custom sensitive column masking, and feature gates (`allow_explain_query`, `allow_schema_search`, `allow_health_check`).
@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI Options**: Added `--policy`, `--audit-log`, `--auth-token`, `--host`, and `--port` CLI options.
 
 ### Fixed
+- **Resolved CI Lint Blocker in `__init__.py`**: Removed duplicate symbol redefinitions (`MAX_PARAMS_COUNT`, `MAX_PARAMS_TOTAL_BYTES`, `MAX_PARAM_KEY_LENGTH`) resolving Ruff `I001` and `F811` errors.
+- **Release Workflow Coverage Source**: Aligned `--cov=src/sqlite_guard_mcp` in `.github/workflows/release.yml` with `pyproject.toml` and `ci.yml`.
 - **Backward-Compatible Schema Payload**: Added dual `"table"` and `"table_name"` keys in `describe_table` to guarantee 100% backward compatibility for existing MCP agents.
 - **Exception Ordering in `execute_guarded_query`**: Caught `sqlite3.ProgrammingError` before `sqlite3.DatabaseError` to prevent multi-statement and invalid parameter errors from being shadowed as generic database failures.
 - **Coverage Configuration**: Resolved pytest-cov `CoverageWarning: Module sqlite_guard_mcp was previously imported, but not measured (module-not-measured)` by targeting the source directory `src/sqlite_guard_mcp`.

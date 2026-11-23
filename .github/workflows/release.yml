@@ -37,7 +37,7 @@ jobs:
         env:
           PYTHONPATH: src
         run: |
-          python -m pytest -v --tb=short --cov=sqlite_guard_mcp --cov-report=term-missing --cov-fail-under=90 -W error::ResourceWarning
+          python -m pytest -v --tb=short --cov=src/sqlite_guard_mcp --cov-report=term-missing --cov-fail-under=90 -W error::ResourceWarning
 
   verify-tag:
     runs-on: ubuntu-24.04

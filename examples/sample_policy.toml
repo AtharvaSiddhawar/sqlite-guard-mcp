@@ -1,0 +1,62 @@
+# SQLite Guard MCP — Example Least-Privilege Access Policy
+# Usage: sqlite-guard-mcp --db /path/to/db.sqlite --policy examples/sample_policy.toml
+
+[tables]
+# Allow-list: If specified, only listed tables and views can be read or queried.
+# Any unlisted table access will be denied at SQLite's authorizer boundary.
+allow = [
+    "customers",
+    "products",
+    "orders",
+    "order_items",
+    "categories",
+    "product_catalog_view"
+]
+
+# Deny-list: Explicitly blocked tables (e.g. system, audit, or user auth tables).
+# Deny rules take precedence over allow rules.
+deny = [
+    "admin_users",
+    "migrations",
+    "schema_history",
+    "internal_secrets"
+]
+
+[columns]
+# Allow-list: Explicit table.column paths permitted for access.
+# If omitted or empty, all columns of allowed tables are accessible (subject to deny rules).
+allow = [
+    "customers.id",
+    "customers.first_name",
+    "customers.last_name",
+    "customers.city",
+    "customers.country",
+    "orders.order_id",
+    "orders.customer_id",
+    "orders.order_date",
+    "orders.total_amount"
+]
+
+# Deny-list: Columns blocked from reading, selection, joins, or filters.
+# Supports wildcard "*.column_name" to deny across all tables.
+deny = [
+    "*.internal_notes",
+    "customers.credit_score",
+    "orders.margin"
+]
+
+[privacy]
+# Sensitive columns: Masked to NULL via SQLite's authorizer boundary.
+# Extends SQLite Guard's built-in credential masking (passwords, tokens, api keys, SSNs).
+sensitive_columns = [
+    "tax_id",
+    "national_identity_number",
+    "security_answer",
+    "pin_code"
+]
+
+[features]
+# Feature gates: Enable or disable specific database intelligence tools.
+allow_explain_query = true
+allow_schema_search = true
+allow_health_check = true

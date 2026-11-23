@@ -1,11 +1,11 @@
-# RELEASE READINESS REPORT: SQLITE GUARD MCP (v0.2.1)
+# RELEASE READINESS REPORT: SQLITE GUARD MCP (v0.2.2)
 
 **Product**: SQLite Guard MCP  
 **Repository**: `https://github.com/AtharvaSiddhawar/sqlite-guard-mcp`  
-**Package Version**: `0.2.1`  
+**Package Version**: `0.2.2`  
 **Published PyPI Version**: `0.2.0`  
-**Target Release**: `v0.2.1`  
-**Release Readiness Date**: 2026-11-18  
+**Target Release**: `v0.2.2`  
+**Release Readiness Date**: 2026-11-23  
 **Auditor**: Autonomous Principal Engineering Team  
 
 ---
@@ -83,23 +83,23 @@ All seven production release gates have been evaluated, executed, and verified.
 
 ## 3. Owner Release Instructions
 
-When the repository owner is ready to release version `0.2.1`:
+When the repository owner is ready to release version `0.2.2`:
 
 ### Step 1: Stage and Commit Changes
 ```bash
 git add .
-git commit -m "feat(release): sqlite-guard-mcp v0.2.1 master build and hardening"
+git commit -m "feat(release): sqlite-guard-mcp v0.2.2 master build and hardening"
 git push origin main
 ```
 
 ### Step 2: Tag the Release
 ```bash
-git tag -a v0.2.1 -m "Release v0.2.1: Intelligence suite, policy engine, bearer auth, and hardening"
-git push origin v0.2.1
+git tag -a v0.2.2 -m "Release v0.2.2: Intelligence suite, policy engine, bearer auth, and hardening"
+git push origin v0.2.2
 ```
 
 ### Step 3: Publish to PyPI
-If using GitHub Actions with Trusted Publishing, pushing tag `v0.2.1` will automatically trigger the release workflow.
+If using GitHub Actions with Trusted Publishing, creating a release for tag `v0.2.2` will automatically trigger the release workflow.
 For manual publishing:
 ```bash
 uv build
@@ -107,7 +107,7 @@ uv publish
 ```
 
 ### Step 4: GitHub Release Notes
-Copy the `[0.2.1]` section from `CHANGELOG.md` directly into the GitHub Release description for tag `v0.2.1`.
+Copy the `[0.2.2]` section from `CHANGELOG.md` directly into the GitHub Release description for tag `v0.2.2`.
 
 ---
 
