@@ -1,10 +1,10 @@
-# INDEPENDENT SECURITY & ADVERSARIAL REVIEW
+# INTERNAL AUTOMATED SECURITY & ADVERSARIAL REVIEW
 
 **Product**: SQLite Guard MCP  
-**Evaluated Version**: `0.2.2`  
+**Evaluated Version**: `0.2.3`  
 **Evaluation Scope**: Threat Modeling, Bytecode Authorizer Analysis, Adversarial Attack Resistance, and Supply Chain Security  
 **Date**: November 2026  
-**Auditor**: Autonomous Application Security & Red-Team Engineering  
+**Auditor**: Internal Autonomous Security & Adversarial Testing Suite (Automated internal adversarial evaluation; not an external third-party audit)  
 
 ---
 

@@ -19,21 +19,25 @@ SQLite Guard MCP adheres to a strict open-source sustainability doctrine:
 
 ## 2. Feature & Tier Matrix
 
-| Capability | Community (Open Source / MIT) | Developer Pro | Team & Enterprise |
-|---|:---:|:---:|:---:|
-| **License** | MIT | Commercial Developer | Commercial Enterprise |
-| **MCP Transports** | stdio, SSE, streamable-http | stdio, SSE, streamable-http | stdio, SSE, streamable-http |
-| **All 7 Core Tools & Resource** | Included (Full Access) | Included (Full Access) | Included (Full Access) |
-| **Native SQLite Authorizer** | Full Bytecode Enforcement | Full Bytecode Enforcement | Full Bytecode Enforcement |
-| **Credential & DDL Masking** | Heuristic + Policy Rules | Heuristic + Policy Rules | Heuristic + Policy Rules |
-| **Local TOML Access Policy** | File-based (`--policy`) | File-based (`--policy`) | Signed Policy Bundles / HTTPS Sync |
-| **Local Audit Logging** | Append-only JSON Lines | Append-only JSON Lines | Real-time SIEM Forwarder (Splunk, Datadog) |
-| **Query Plan & Index Diagnostics**| CLI / MCP Tool Output | CLI + Interactive Workbench | Fleet-wide Index Optimization Reports |
-| **Database Health Check** | `PRAGMA quick_check` & FKs | Integrated Diagnostic Views | Continuous Schema Drift Detection |
-| **Local Developer Workbench** | Optional CLI launcher | Interactive Visual Dashboard | Team Workspace & Shared Catalogs |
-| **Schema Migration Diffing** | CLI Snapshot Utility | Visual Schema Diff View | Static Migration Risk Review CI Plugin |
-| **Central Fleet Management** | N/A | N/A | Central Policy & Configuration Server |
-| **Support & Maintenance** | Community GitHub Issues | Priority Email Support | Dedicated Enterprise SLA & Security Advisory |
+| Capability | Current Status | Community (Open Source / MIT) | Developer Pro | Team & Enterprise |
+|---|:---:|:---:|:---:|:---:|
+| **License** | Active | MIT | Commercial Developer | Commercial Enterprise |
+| **MCP Transports** | Implemented | stdio, SSE, streamable-http | stdio, SSE, streamable-http | stdio, SSE, streamable-http |
+| **All 11 Core Tools & 2 Resources** | Implemented | Included (Full Access) | Included (Full Access) | Included (Full Access) |
+| **Native SQLite Authorizer** | Implemented | Full Bytecode Enforcement | Full Bytecode Enforcement | Full Bytecode Enforcement |
+| **Credential & DDL Masking** | Implemented | Heuristic + Policy Rules | Heuristic + Policy Rules | Heuristic + Policy Rules |
+| **Local TOML Access Policy** | Implemented | File-based (`--policy`) | File-based (`--policy`) | Signed Policy Bundles / HTTPS Sync |
+| **Local Audit Logging** | Implemented | Append-only JSON Lines | Append-only JSON Lines | Real-time SIEM Forwarder (Splunk, Datadog) |
+| **Query Plan & Index Diagnostics**| Implemented | CLI / MCP Tool Output | CLI + Interactive Workbench | Fleet-wide Index Optimization Reports |
+| **Database Health Check** | Implemented | `PRAGMA quick_check` & FKs | Integrated Diagnostic Views | Continuous Schema Drift Detection |
+| **Index Laboratory (`simulate_candidate_index`)** | Implemented | Safe disposable snapshot simulation | Integrated with Workbench UI | Automated Index CI Pipeline |
+| **Privacy-Preserving Profiler** | Implemented | Cardinality, null %, masked stats | Visual distribution charts | Enterprise PII Scan Reports |
+| **Schema Snapshot & Diff** | Implemented | Canonical JSON & Structural Diff | Visual Schema Diff View | Continuous Drift Alerting |
+| **Static Migration Review** | Implemented | AST/Regex Safety & Lock Risk | Safe Migration Playbooks | Automated PR Gatekeeper |
+| **CLI Doctor & Policy Explain** | Implemented | Comprehensive diagnostic report | Integrated health status | Fleet policy audit CLI |
+| **Local Developer Workbench UI** | Planned | Optional CLI launcher | Interactive Visual Dashboard | Team Workspace & Shared Catalogs |
+| **Central Fleet Management** | Planned | N/A | N/A | Central Policy & Configuration Server |
+| **Support & Maintenance** | Active | Community GitHub Issues | Priority Email Support | Dedicated Enterprise SLA & Security Advisory |
 
 ---
 

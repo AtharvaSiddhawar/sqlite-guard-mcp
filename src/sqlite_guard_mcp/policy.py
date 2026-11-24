@@ -20,10 +20,17 @@ class AccessPolicy:
     deny_tables: frozenset[str] = field(default_factory=frozenset)
     allow_columns: dict[str, frozenset[str]] = field(default_factory=dict)
     deny_columns: dict[str, frozenset[str]] = field(default_factory=dict)
+    allow_columns_wildcard: frozenset[str] = field(default_factory=frozenset)
+    deny_columns_wildcard: frozenset[str] = field(default_factory=frozenset)
     custom_sensitive_columns: frozenset[str] = field(default_factory=frozenset)
+    allow_explain_query: bool = True
     allow_database_overview: bool = True
     allow_schema_search: bool = True
     allow_health_check: bool = True
+    allow_profiling: bool = True
+    allow_index_lab: bool = True
+    allow_schema_diff: bool = True
+    allow_migration_review: bool = True
 
     def is_table_allowed(self, table_name: str) -> bool:
         """Return True if table read access is permitted."""
@@ -42,13 +49,21 @@ class AccessPolicy:
         tbl = table_name.lower()
         col = column_name.lower()
 
-        # Deny rules take precedence
+        # Wildcard deny rules take precedence across all tables
+        if col in self.deny_columns_wildcard:
+            return False
+
+        # Table-specific deny rules take precedence
         if tbl in self.deny_columns and col in self.deny_columns[tbl]:
             return False
 
-        # If column allow-list defined for this table, must be present
+        # Table-specific allow-list takes precedence if defined
         if tbl in self.allow_columns:
             return col in self.allow_columns[tbl]
+
+        # Wildcard allow-list if present
+        if self.allow_columns_wildcard:
+            return col in self.allow_columns_wildcard
 
         return True
 
@@ -56,6 +71,83 @@ class AccessPolicy:
         """Return True if column matches custom sensitive overrides."""
         col = column_name.lower()
         return col in self.custom_sensitive_columns
+
+    def explain_access(self, table_name: str, column_name: str | None = None) -> dict[str, Any]:
+        """Explain whether and why a table or column is allowed, denied, or masked."""
+        tbl = table_name.lower()
+        if tbl in self.deny_tables:
+            return {
+                "allowed": False,
+                "reason": f"Table '{table_name}' matches deny_tables rule.",
+                "table_allowed": False,
+                "column_allowed": False if column_name else None,
+                "is_sensitive": False,
+            }
+        if self.allow_tables is not None and tbl not in self.allow_tables:
+            return {
+                "allowed": False,
+                "reason": f"Table '{table_name}' is not in allow_tables allow-list.",
+                "table_allowed": False,
+                "column_allowed": False if column_name else None,
+                "is_sensitive": False,
+            }
+
+        if column_name is None:
+            return {
+                "allowed": True,
+                "reason": f"Table '{table_name}' is allowed.",
+                "table_allowed": True,
+                "column_allowed": None,
+                "is_sensitive": False,
+            }
+
+        col = column_name.lower()
+        is_sens = self.is_column_sensitive(table_name, column_name)
+
+        if col in self.deny_columns_wildcard:
+            return {
+                "allowed": False,
+                "reason": f"Column '{column_name}' matches wildcard deny rule (*.{col}).",
+                "table_allowed": True,
+                "column_allowed": False,
+                "is_sensitive": is_sens,
+            }
+        if tbl in self.deny_columns and col in self.deny_columns[tbl]:
+            return {
+                "allowed": False,
+                "reason": f"Column '{table_name}.{column_name}' matches table column deny rule.",
+                "table_allowed": True,
+                "column_allowed": False,
+                "is_sensitive": is_sens,
+            }
+        if tbl in self.allow_columns:
+            if col not in self.allow_columns[tbl]:
+                return {
+                    "allowed": False,
+                    "reason": (
+                        f"Column '{column_name}' is not in allow_columns allow-list "
+                        f"for table '{table_name}'."
+                    ),
+                    "table_allowed": True,
+                    "column_allowed": False,
+                    "is_sensitive": is_sens,
+                }
+        elif self.allow_columns_wildcard and col not in self.allow_columns_wildcard:
+            return {
+                "allowed": False,
+                "reason": f"Column '{column_name}' is not in wildcard allow-list.",
+                "table_allowed": True,
+                "column_allowed": False,
+                "is_sensitive": is_sens,
+            }
+
+        return {
+            "allowed": True,
+            "reason": f"Column '{table_name}.{column_name}' is allowed.",
+            "table_allowed": True,
+            "column_allowed": True,
+            "is_sensitive": is_sens,
+        }
 
 
 def default_policy() -> AccessPolicy:
@@ -129,8 +221,10 @@ def load_policy(source: str | Path | dict[str, Any] | None) -> AccessPolicy:
             deny_tables.update(x.lower() for x in raw_deny)
 
     # Parse columns section
-    allow_columns: dict[str, frozenset[str]] = {}
-    deny_columns: dict[str, frozenset[str]] = {}
+    allow_cols_map: dict[str, set[str]] = {}
+    deny_cols_map: dict[str, set[str]] = {}
+    allow_wildcards: set[str] = set()
+    deny_wildcards: set[str] = set()
 
     if "columns" in data:
         c_sec = data["columns"]
@@ -139,21 +233,90 @@ def load_policy(source: str | Path | dict[str, Any] | None) -> AccessPolicy:
 
         if "allow" in c_sec:
             raw_c_allow = c_sec["allow"]
-            if not isinstance(raw_c_allow, dict):
-                raise ValueError("columns.allow must be a mapping of table name to column lists.")
-            for tbl, cols in raw_c_allow.items():
-                if not isinstance(cols, list) or not all(isinstance(x, str) for x in cols):
-                    raise ValueError(f"columns.allow.{tbl} must be a list of column strings.")
-                allow_columns[tbl.lower()] = frozenset(x.lower() for x in cols)
+            if isinstance(raw_c_allow, list):
+                if not all(isinstance(x, str) for x in raw_c_allow):
+                    raise ValueError(
+                        "columns.allow must be a mapping of table names to column lists, "
+                        "or a list of 'table.column' strings."
+                    )
+                for item in raw_c_allow:
+                    item_str = item.strip()
+                    if "." not in item_str:
+                        raise ValueError(
+                            "columns.allow must be a mapping of table names to column lists, "
+                            "or a list of 'table.column' strings."
+                        )
+                    tbl, col = item_str.split(".", 1)
+                    tbl = tbl.strip().lower()
+                    col = col.strip().lower()
+                    if not tbl or not col:
+                        raise ValueError(
+                            "columns.allow must be a mapping of table names to column lists, "
+                            "or a list of 'table.column' strings."
+                        )
+                    if tbl == "*":
+                        allow_wildcards.add(col)
+                    else:
+                        allow_cols_map.setdefault(tbl, set()).add(col)
+            elif isinstance(raw_c_allow, dict):
+                for tbl, cols in raw_c_allow.items():
+                    if not isinstance(cols, list) or not all(isinstance(x, str) for x in cols):
+                        raise ValueError(f"columns.allow.{tbl} must be a list of column strings.")
+                    tbl_lower = tbl.lower()
+                    if tbl_lower == "*":
+                        allow_wildcards.update(x.lower() for x in cols)
+                    else:
+                        allow_cols_map.setdefault(tbl_lower, set()).update(x.lower() for x in cols)
+            else:
+                raise ValueError(
+                    "columns.allow must be a mapping of table names to column lists, "
+                    "or a list of 'table.column' strings."
+                )
 
         if "deny" in c_sec:
             raw_c_deny = c_sec["deny"]
-            if not isinstance(raw_c_deny, dict):
-                raise ValueError("columns.deny must be a mapping of table name to column lists.")
-            for tbl, cols in raw_c_deny.items():
-                if not isinstance(cols, list) or not all(isinstance(x, str) for x in cols):
-                    raise ValueError(f"columns.deny.{tbl} must be a list of column strings.")
-                deny_columns[tbl.lower()] = frozenset(x.lower() for x in cols)
+            if isinstance(raw_c_deny, list):
+                if not all(isinstance(x, str) for x in raw_c_deny):
+                    raise ValueError(
+                        "columns.deny must be a mapping of table names to column lists, "
+                        "or a list of 'table.column' strings."
+                    )
+                for item in raw_c_deny:
+                    item_str = item.strip()
+                    if "." not in item_str:
+                        raise ValueError(
+                            "columns.deny must be a mapping of table names to column lists, "
+                            "or a list of 'table.column' strings."
+                        )
+                    tbl, col = item_str.split(".", 1)
+                    tbl = tbl.strip().lower()
+                    col = col.strip().lower()
+                    if not tbl or not col:
+                        raise ValueError(
+                            "columns.deny must be a mapping of table names to column lists, "
+                            "or a list of 'table.column' strings."
+                        )
+                    if tbl == "*":
+                        deny_wildcards.add(col)
+                    else:
+                        deny_cols_map.setdefault(tbl, set()).add(col)
+            elif isinstance(raw_c_deny, dict):
+                for tbl, cols in raw_c_deny.items():
+                    if not isinstance(cols, list) or not all(isinstance(x, str) for x in cols):
+                        raise ValueError(f"columns.deny.{tbl} must be a list of column strings.")
+                    tbl_lower = tbl.lower()
+                    if tbl_lower == "*":
+                        deny_wildcards.update(x.lower() for x in cols)
+                    else:
+                        deny_cols_map.setdefault(tbl_lower, set()).update(x.lower() for x in cols)
+            else:
+                raise ValueError(
+                    "columns.deny must be a mapping of table names to column lists, "
+                    "or a list of 'table.column' strings."
+                )
+
+    allow_columns_frozen = {tbl: frozenset(cols) for tbl, cols in allow_cols_map.items()}
+    deny_columns_frozen = {tbl: frozenset(cols) for tbl, cols in deny_cols_map.items()}
 
     # Parse privacy section
     custom_sensitive: set[str] = set()
@@ -161,44 +324,59 @@ def load_policy(source: str | Path | dict[str, Any] | None) -> AccessPolicy:
         p_sec = data["privacy"]
         if not isinstance(p_sec, dict):
             raise ValueError("The [privacy] section must be a table.")
-        if "custom_sensitive_columns" in p_sec:
-            raw_sens = p_sec["custom_sensitive_columns"]
-            if not isinstance(raw_sens, list) or not all(isinstance(x, str) for x in raw_sens):
-                raise ValueError("privacy.custom_sensitive_columns must be a list of column names.")
-            custom_sensitive.update(x.lower() for x in raw_sens)
+        allowed_privacy_keys = {"custom_sensitive_columns", "sensitive_columns"}
+        unknown_p_keys = set(p_sec.keys()) - allowed_privacy_keys
+        if unknown_p_keys:
+            raise ValueError(f"Unknown keys in [privacy]: {', '.join(sorted(unknown_p_keys))}")
+
+        for k in ("custom_sensitive_columns", "sensitive_columns"):
+            if k in p_sec:
+                raw_sens = p_sec[k]
+                if not isinstance(raw_sens, list) or not all(isinstance(x, str) for x in raw_sens):
+                    raise ValueError(f"privacy.{k} must be a list of column names.")
+                custom_sensitive.update(x.lower() for x in raw_sens)
 
     # Parse features section
-    allow_overview = True
-    allow_search = True
-    allow_health = True
+    allowed_feature_flags = {
+        "allow_explain_query",
+        "allow_database_overview",
+        "allow_schema_search",
+        "allow_health_check",
+        "allow_profiling",
+        "allow_index_lab",
+        "allow_schema_diff",
+        "allow_migration_review",
+    }
+    feature_flags = {k: True for k in allowed_feature_flags}
 
     if "features" in data:
         f_sec = data["features"]
         if not isinstance(f_sec, dict):
             raise ValueError("The [features] section must be a table.")
-        if "allow_database_overview" in f_sec:
-            val = f_sec["allow_database_overview"]
-            if not isinstance(val, bool):
-                raise ValueError("features.allow_database_overview must be a boolean.")
-            allow_overview = val
-        if "allow_schema_search" in f_sec:
-            val = f_sec["allow_schema_search"]
-            if not isinstance(val, bool):
-                raise ValueError("features.allow_schema_search must be a boolean.")
-            allow_search = val
-        if "allow_health_check" in f_sec:
-            val = f_sec["allow_health_check"]
-            if not isinstance(val, bool):
-                raise ValueError("features.allow_health_check must be a boolean.")
-            allow_health = val
+        unknown_f_keys = set(f_sec.keys()) - allowed_feature_flags
+        if unknown_f_keys:
+            raise ValueError(
+                f"Unknown feature flags in [features]: {', '.join(sorted(unknown_f_keys))}"
+            )
+        for k, v in f_sec.items():
+            if not isinstance(v, bool):
+                raise ValueError(f"features.{k} must be a boolean.")
+            feature_flags[k] = v
 
     return AccessPolicy(
         allow_tables=allow_tables,
         deny_tables=frozenset(deny_tables),
-        allow_columns=allow_columns,
-        deny_columns=deny_columns,
+        allow_columns=allow_columns_frozen,
+        deny_columns=deny_columns_frozen,
+        allow_columns_wildcard=frozenset(allow_wildcards),
+        deny_columns_wildcard=frozenset(deny_wildcards),
         custom_sensitive_columns=frozenset(custom_sensitive),
-        allow_database_overview=allow_overview,
-        allow_schema_search=allow_search,
-        allow_health_check=allow_health,
+        allow_explain_query=feature_flags["allow_explain_query"],
+        allow_database_overview=feature_flags["allow_database_overview"],
+        allow_schema_search=feature_flags["allow_schema_search"],
+        allow_health_check=feature_flags["allow_health_check"],
+        allow_profiling=feature_flags["allow_profiling"],
+        allow_index_lab=feature_flags["allow_index_lab"],
+        allow_schema_diff=feature_flags["allow_schema_diff"],
+        allow_migration_review=feature_flags["allow_migration_review"],
     )

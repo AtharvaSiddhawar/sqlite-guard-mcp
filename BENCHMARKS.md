@@ -1,15 +1,16 @@
 # PERFORMANCE BENCHMARKS & LATENCY EVALUATION
 
-**Product**: SQLite Guard MCP (v0.2.2)  
+**Product**: SQLite Guard MCP (v0.2.3)  
 **Date**: November 2026  
 **Benchmarking Harness**: `benchmarks/run_benchmarks.py`  
-**Test Environment**: AMD Ryzen / Intel Core x86_64, Windows 11, Python 3.12, SQLite 3.45+  
+**Machine-Readable Results**: `benchmarks/results.json`  
+**Test Environment**: AMD Ryzen / Intel Core x86_64, Windows 11 / Linux, Python 3.12, SQLite 3.45+  
 
 ---
 
 ## 1. Methodology & Dataset Specification
 
-Benchmarking evaluates latency, overhead, and memory efficiency across the primary MCP tools and resources using a deterministically generated synthetic SQLite database.
+Benchmarking evaluates latency, execution overhead, percentile distributions (p50, p95, p99), and memory efficiency using a deterministically generated synthetic SQLite database.
 
 ### Synthetic Database Parameters:
 - **Table Count**: 30 relational dataset tables + 1 base organization table (`org_units`).
@@ -21,23 +22,40 @@ Benchmarking evaluates latency, overhead, and memory efficiency across the prima
 
 ---
 
-## 2. Operation Latency Measurements
+## 2. Operation Latency & Percentile Distributions
 
-All metrics represent mean execution times across 10 to 50 warm iterations:
+All operations were benchmarked across 10 to 50 warm iterations. Latencies are reported in milliseconds (ms) with median (p50), 95th percentile (p95), 99th percentile (p99), and arithmetic mean:
 
-| Operation / Tool | Latency (ms) | Description & Scope |
-|---|:---:|---|
-| **`get_database_overview`** | **5.95 ms** | Page size, page count, schema version, table/view/index counts. |
-| **`describe_database_table`** | **6.11 ms** | Full table metadata, column types, FK discovery, and index overlap analysis. |
-| **`read_query` (with Masking)**| **5.75 ms** | Safe execution of 100 rows with C-authorizer masking of sensitive columns. |
-| **`explain_read_query`** | **6.69 ms** | `EXPLAIN QUERY PLAN` parsing, table scan detection, and structured observations. |
-| **`search_database_schema`** | **8.12 ms** | Case-insensitive regex/pattern scan across all tables, views, columns, and indexes. |
-| **`schema://summary` (Resource)**| **18.94 ms** | Zero-turn inspection extracting complete schema definitions across 30 tables in one read. |
-| **`check_database_health`** | **146.05 ms** | Comprehensive `PRAGMA quick_check`, foreign key validation, and index redundancy analysis. |
+| Operation / Tool | p50 (ms) | p95 (ms) | p99 (ms) | Mean (ms) | Description & Scope |
+|---|:---:|:---:|:---:|:---:|---|
+| **`raw_sqlite_query` (Baseline)** | 1.25 ms | 9.68 ms | 23.97 ms | 2.79 ms | Raw unbounded `sqlite3` cursor query fetching 100 rows without security controls. |
+| **`guarded_read_query`** | 26.59 ms | 82.11 ms | 106.69 ms | 35.08 ms | Read-only URI mode, authorizer bytecode interception, credential masking, timeout progress handler, row capping, JSON bounds. |
+| **`get_database_overview`** | 9.24 ms | 42.04 ms | 58.19 ms | 15.04 ms | Page size, page count, schema version, table/view/index counts. |
+| **`describe_database_table`** | 10.96 ms | 45.20 ms | 62.10 ms | 18.25 ms | Full table metadata, column types, FK discovery, and index overlap analysis. |
+| **`explain_read_query`** | 10.96 ms | 81.18 ms | 168.24 ms | 20.48 ms | `EXPLAIN QUERY PLAN` execution, table scan detection, and structured diagnostics. |
+| **`search_database_schema`** | 20.52 ms | 38.48 ms | 106.74 ms | 25.14 ms | Case-insensitive search across all tables, views, columns, and indexes. |
+| **`schema://summary` (Resource)** | 108.25 ms | 256.52 ms | 295.15 ms | 133.59 ms | Zero-turn inspection extracting complete schema definitions across 30 tables in one read. |
+| **`check_database_health`** | 365.18 ms | 396.76 ms | 400.38 ms | 371.37 ms | Comprehensive `PRAGMA quick_check`, foreign key validation, and index redundancy analysis. |
+| **`simulate_candidate_index`** | 19.83 ms | 25.27 ms | 26.04 ms | 21.18 ms | Index Laboratory: In-memory clone, candidate index creation, timing & plan diff without touching source. |
+| **`profile_database_table`** | 16.80 ms | 21.32 ms | 22.23 ms | 17.70 ms | Privacy-preserving profiling: null %, cardinality, distinct counts, safe min/max, masking. |
+| **`snapshot_schema`** | 66.86 ms | 75.15 ms | 76.18 ms | 68.35 ms | Canonical JSON schema snapshot generation across 30 tables. |
+| **`diff_schemas`** | 13.26 ms | 16.82 ms | 17.89 ms | 13.51 ms | Structural diffing between two schema snapshots, detecting breaking changes. |
+| **`review_migration`** | 0.14 ms | 0.28 ms | 1.29 ms | 0.20 ms | High-speed AST/regex static safety review of migration scripts. |
 
 ---
 
-## 3. Token Footprint & Agent Context Efficiency
+## 3. Memory Footprint Profile
+
+Memory allocation was tracked during full execution using Python's `tracemalloc`:
+
+- **Current Memory**: `~720 KB`
+- **Peak Memory**: `~806 KB` (`0.79 MB`)
+
+**Key Takeaway**: SQLite Guard MCP maintains an extremely lean memory footprint of under **1 megabyte** peak memory even when querying, profiling, and diffing multi-table databases.
+
+---
+
+## 4. Token Footprint & Agent Context Efficiency
 
 One of SQLite Guard MCP's major architectural differentiators is **LLM context efficiency**:
 
@@ -56,20 +74,12 @@ SQLite Guard MCP Zero-Turn Approach:
 
 ---
 
-## 4. Overhead vs Raw Native SQLite
-
-| Query Operation | Raw Python `sqlite3` | SQLite Guard MCP | Overhead | Security Controls Applied |
-|---|:---:|:---:|:---:|---|
-| **`SELECT * (100 rows)`** | 4.80 ms | 5.75 ms | **+0.95 ms** | Read-only URI mode, authorizer bytecode interception, credential masking, timeout progress handler, row capping, JSON serialization bounds. |
-
-**Key Takeaway**: SQLite Guard introduces less than **1 millisecond** of latency overhead over raw unbounded `sqlite3`, while providing complete defense-in-depth security, credential masking, and memory safety.
-
----
-
 ## 5. How to Reproduce Benchmarks
 
-Run the benchmark script directly from the repository root:
+Run the benchmark harness directly from the repository root:
 
 ```bash
 uv run python benchmarks/run_benchmarks.py
 ```
+
+Results are printed to stdout and saved in machine-readable JSON format to `benchmarks/results.json`.

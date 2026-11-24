@@ -321,6 +321,10 @@ async def test_official_mcp_client_lists_and_calls_tools(
             "get_database_overview",
             "search_database_schema",
             "check_database_health",
+            "simulate_candidate_index",
+            "profile_database_table",
+            "diff_database_schemas",
+            "review_migration_script",
         }
 
         result = await client.call_tool(
@@ -334,6 +338,44 @@ async def test_official_mcp_client_lists_and_calls_tools(
 
         assert decoded["ok"] is True
         assert decoded["row_count"] == 2
+
+        # Test calling new MCP differentiator tools
+        prof_res = await client.call_tool(
+            "profile_database_table",
+            {"table_name": "people"},
+        )
+        assert prof_res.is_error is False
+        assert json.loads(prof_res.content[0].text)["success"] is True
+
+        sim_res = await client.call_tool(
+            "simulate_candidate_index",
+            {
+                "sql": "SELECT name FROM people WHERE name = 'Alice'",
+                "candidate_indexes": "CREATE INDEX idx_p_name ON people(name);",
+            },
+        )
+        assert sim_res.is_error is False
+        assert json.loads(sim_res.content[0].text)["success"] is True
+
+        rev_res = await client.call_tool(
+            "review_migration_script",
+            {"migration_sql": "BEGIN; CREATE TABLE t (x INT); COMMIT;"},
+        )
+        assert rev_res.is_error is False
+        assert json.loads(rev_res.content[0].text)["success"] is True
+
+        diff_res = await client.call_tool(
+            "diff_database_schemas",
+            {"target_db_path": str(database)},
+        )
+        assert diff_res.is_error is False
+        assert json.loads(diff_res.content[0].text)["success"] is True
+
+        # Test reading schema://snapshot resource
+        snap_res = await client.read_resource("schema://snapshot")
+        assert len(snap_res.contents) > 0
+        snap_data = json.loads(snap_res.contents[0].text)
+        assert snap_data["success"] is True
 
 
 def test_extended_credential_names_are_masked(

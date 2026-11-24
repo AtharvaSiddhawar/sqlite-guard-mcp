@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-11-24
+
+### Added
+- **Index Laboratory (`simulate_candidate_index`)**: Safe candidate index testing on isolated disposable database snapshots using SQLite's online backup API. Compares `EXPLAIN QUERY PLAN` observations and execution latency before and after applying candidate index proposals without modifying the source database.
+- **Privacy-Preserving Data Profiling (`profile_database_table`)**: Computes column-level null ratios, cardinality estimations, distinct counts, safe min/max bounds, and empty string counts while enforcing column security policies and masking sensitive credential columns.
+- **Canonical Schema Snapshot & Diff (`snapshot_schema`, `diff_schemas`, `diff_database_schemas`)**: Generates canonical JSON schema snapshots and structural diffs between database states or environments, detecting added/removed tables, column alterations, missing indexes, and breaking changes.
+- **Static Migration Safety Review (`review_migration`, `review_migration_script`)**: High-speed AST/regex static safety analysis for SQLite migration scripts without executing SQL. Detects destructive operations (`DROP TABLE`, `DROP COLUMN`), non-constant `NOT NULL` additions, missing transaction boundaries, dangerous PRAGMAs, and database attachment attempts.
+- **System Doctor & Environment Diagnostics (`doctor.py`, `--doctor`)**: CLI diagnostic utility verifying platform, Python version, SQLite library version, compile options (`ENABLE_FTS5`, `ENABLE_JSON1`, `ENABLE_RTREE`), environment variables, and target database integrity (`quick_check`, foreign key checks).
+- **Policy Validation & Explain Commands (`--validate-policy`, `--explain-policy-table`)**: CLI subcommands to validate policy files and explain access decisions for specific tables and columns.
+- **Enhanced Access Policy Engine**: Added support for dotted `table.column` and wildcard `*.column` rules in `columns.allow` and `columns.deny`, as well as feature flag controls (`allow_profiling`, `allow_index_lab`, `allow_schema_diff`, `allow_migration_review`).
+- **New MCP Resource**: Added `schema://snapshot` exposing full canonical schema definitions.
+
+### Fixed
+- **Policy Loading of Dotted Column Lists (Finding A)**: Resolved `ValueError: columns.allow must be a mapping of table name to column lists` when loading dotted lists from `examples/sample_policy.toml`.
+- **Query Explain Feature Gate**: Enforced `allow_explain_query` policy check in `explain_query`.
+- **Benchmark Suite Realism & Observability (Finding B)**: Rebuilt `benchmarks/run_benchmarks.py` to measure raw SQLite baseline latency, `tracemalloc` peak memory consumption (< 1 MB), and percentile latencies (p50, p95, p99), exporting machine-readable output to `benchmarks/results.json`.
+- **Release Documentation Alignment (Finding C)**: Updated `RELEASE_READINESS.md` to reflect live PyPI state (`0.2.0`, `0.2.2`) and prepare for `0.2.3`.
+- **Accurate Security Review Scope (Finding D)**: Updated `SECURITY_REVIEW.md` header to explicitly state internal automated adversarial review rather than an external independent audit.
+- **Commercial Roadmap Clarification (Finding E)**: Updated `COMMERCIAL_STRATEGY.md` with explicit status indicators for implemented open-source core features versus planned commercial roadmap items.
+
 ## [0.2.2] - 2026-11-23
 
 ### Added

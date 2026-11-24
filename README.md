@@ -13,14 +13,24 @@ A read-only, security-hardened [Model Context Protocol](https://modelcontextprot
 - Standard MCP transports (`stdio`, `sse`, and `streamable-http`) through the official MCP Python SDK.
 - HTTP / SSE Bearer Token Authentication via `BearerAuthMiddleware` (`--auth-token` or `SQLITE_GUARD_AUTH_TOKEN`).
 - Read-only `SELECT`, `WITH`, and `VALUES` queries with strictly validated bound parameters.
-- Built-in schema inspection & database intelligence:
+- Built-in schema inspection, database intelligence & safety laboratory:
   - `list_database_tables`: List tables and views.
   - `describe_database_table`: Detailed schema inspection with unindexed foreign keys and overlapping index diagnostics.
   - `explain_read_query`: Query plan diagnostics with structured observations and confidence metrics.
   - `get_database_overview`: High-level metrics (page count, schema version, table/index/view counts, approximate size).
   - `search_database_schema`: Bounded case-insensitive search across tables, views, columns, and indexes.
   - `check_database_health`: Quick integrity check, foreign key violation diagnostics, and index redundancy analysis.
-- MCP Resource support: `schema://summary` provides zero-turn inspection of tables and schemas.
+  - `simulate_candidate_index`: Index Laboratory — safe execution and plan comparison on disposable in-memory snapshots without touching the source database.
+  - `profile_database_table`: Privacy-preserving data profiling — null ratios, cardinality, distinct counts, safe min/max, and credential masking.
+  - `diff_database_schemas`: Structural schema diffing between two databases, detecting breaking changes, dropped columns, and drift.
+  - `review_migration_script`: Static safety inspection for migration scripts without executing SQL (checks drops, locks, transactions, and dangerous pragmas).
+- MCP Resources:
+  - `schema://summary`: Zero-turn inspection of tables, views, and column definitions.
+  - `schema://snapshot`: Canonical JSON snapshot of all tables, columns, indexes, and foreign keys.
+- CLI System Doctor & Policy Diagnostics:
+  - `sqlite-guard-mcp --doctor`: Comprehensive health report of platform, Python, SQLite compilation options, and database integrity.
+  - `sqlite-guard-mcp --validate-policy --policy <file>`: Validate TOML policy syntax and rules.
+  - `sqlite-guard-mcp --policy <file> --explain-policy-table <table_name> [--explain-policy-column <col>]`: Explain access control decisions in structured JSON.
 - Granular Access Policy Engine (`--policy` / `SQLITE_GUARD_POLICY`): Fail-closed TOML access rules for table/column allow & deny lists, custom sensitive column masking, and feature toggles.
 - Tamper-evident Audit Logging (`--audit-log` / `SQLITE_GUARD_AUDIT_LOG`): Structured JSON Lines logging with SHA-256 query fingerprinting and privacy-safe metadata.
 - Native SQLite authorizer strictly denies write operations, database attachments, dangerous functions (`load_extension`, `readfile`, `writefile`, `fsdir`, `eval`, etc.), and unapproved PRAGMAs.
@@ -118,6 +128,10 @@ allow_health_check = true
 | `get_database_overview()` | Get safe database metrics: schema version, page size, page count, table/index/view counts. |
 | `search_database_schema(query, max_matches?)` | Search table names, column names, view names, and index names case-insensitively. |
 | `check_database_health()` | Run quick integrity check, check foreign key integrity, and report redundant indexes. |
+| `simulate_candidate_index(sql, candidate_indexes, params?)` | Index Laboratory: Test candidate indexes on isolated in-memory clone and measure latency/plan diff. |
+| `profile_database_table(table_name, max_sample_rows?)` | Privacy-preserving profiling: null ratios, cardinality, distinct counts, safe min/max, masking. |
+| `diff_database_schemas(target_db_path)` | Compare current schema against another database file to detect added, removed, or modified objects. |
+| `review_migration_script(migration_sql)` | Statically inspect migration SQL for risk, table drops, locks, and missing transactions. |
 
 `params` accepts a JSON object for named parameters or an array for positional parameters. Example: `{"sql":"SELECT name FROM people WHERE id = ?","params":[7]}`.
 
@@ -126,6 +140,7 @@ allow_health_check = true
 | Resource URI | Purpose |
 |---|---|
 | `schema://summary` | Provides a complete JSON summary of all tables, views, and columns without requiring multiple tool calls. |
+| `schema://snapshot` | Provides a complete canonical JSON snapshot of all tables, columns, indexes, and foreign keys. |
 
 ## Masking behavior
 

@@ -11,6 +11,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from datetime import UTC, datetime
@@ -1350,6 +1351,19 @@ def explain_query(
     audit_file: Path | str | None = None,
 ) -> dict[str, Any]:
     """Return SQLite's query plan and diagnostics for a SELECT or WITH query."""
+    effective_policy = policy or default_policy()
+    if not effective_policy.allow_explain_query:
+        err = _error("Query explain plan is disabled by policy.", "access_denied")
+        _record_audit_event(
+            audit_file,
+            "explain_read_query",
+            "explain",
+            sql=sql,
+            status="error",
+            error_code="access_denied",
+        )
+        return err
+
     try:
         statement = _validate_query(sql, explain=True)
 
@@ -2322,6 +2336,111 @@ def create_server(
         )
         return json.dumps(result, ensure_ascii=False)
 
+    @server.tool()
+    def simulate_candidate_index(
+        sql: Annotated[
+            str,
+            Field(description="Read-only SELECT or WITH SQL query to optimize."),
+        ],
+        candidate_indexes: Annotated[
+            list[str] | str,
+            Field(
+                description=(
+                    "One or more 'CREATE [UNIQUE] INDEX ... ON table(...)' candidate statements."
+                )
+            ),
+        ],
+        params: Annotated[
+            dict[str, Any] | list[Any] | None,
+            Field(
+                default=None,
+                description="Optional parameters for the query.",
+            ),
+        ] = None,
+    ) -> str:
+        """Simulate candidate index performance on an isolated disposable database snapshot."""
+        from sqlite_guard_mcp.index_lab import simulate_index
+
+        result = simulate_index(
+            database,
+            sql,
+            candidate_indexes,
+            params,
+            timeout_seconds=timeout_seconds,
+            policy=effective_policy,
+            audit_file=audit_file,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def profile_database_table(
+        table_name: Annotated[
+            str,
+            Field(description="Name of the table or view to profile."),
+        ],
+        max_sample_rows: Annotated[
+            int,
+            Field(
+                default=1000,
+                description="Maximum rows to sample for distinct count and cardinality.",
+            ),
+        ] = 1000,
+    ) -> str:
+        """Generate privacy-preserving statistical profiles (null %, cardinality, safe min/max)."""
+        from sqlite_guard_mcp.profiler import profile_table
+
+        result = profile_table(
+            database,
+            table_name,
+            max_sample_rows=max_sample_rows,
+            policy=effective_policy,
+            audit_file=audit_file,
+            timeout_seconds=timeout_seconds,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def diff_database_schemas(
+        target_db_path: Annotated[
+            str,
+            Field(description="File path of the second SQLite database to compare against."),
+        ],
+    ) -> str:
+        """Compare the current database schema against another SQLite database to detect diffs."""
+        from sqlite_guard_mcp.schema_diff import diff_schemas, snapshot_schema
+
+        snap_a = snapshot_schema(database, policy=effective_policy, timeout_seconds=timeout_seconds)
+        snap_b = snapshot_schema(
+            target_db_path, policy=effective_policy, timeout_seconds=timeout_seconds
+        )
+        result = diff_schemas(snap_a, snap_b)
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.tool()
+    def review_migration_script(
+        migration_sql: Annotated[
+            str,
+            Field(description="SQLite migration SQL script to analyze for safety and risk."),
+        ],
+    ) -> str:
+        """Statically inspect a SQLite migration script for safety, table drops, and locks."""
+        from sqlite_guard_mcp.schema_diff import review_migration
+
+        result = review_migration(migration_sql)
+        return json.dumps(result, ensure_ascii=False)
+
+    @server.resource("schema://snapshot")
+    def database_schema_snapshot() -> str:
+        """Provide a complete canonical JSON snapshot of all tables, columns, indexes, and FKs."""
+        from sqlite_guard_mcp.schema_diff import snapshot_schema
+
+        result = snapshot_schema(
+            database,
+            policy=effective_policy,
+            timeout_seconds=timeout_seconds,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
     return server
 
 
@@ -2392,8 +2511,54 @@ def main(argv: list[str] | None = None) -> int:
         default=8000,
         help="Port to bind for HTTP/SSE transports (default: 8000).",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run environment, SQLite, and database health diagnostics.",
+    )
+    parser.add_argument(
+        "--validate-policy",
+        action="store_true",
+        help="Validate the policy file specified in --policy and exit.",
+    )
+    parser.add_argument(
+        "--explain-policy-table",
+        help="Table name to explain policy access for.",
+    )
+    parser.add_argument(
+        "--explain-policy-column",
+        help="Column name to explain policy access for (optional).",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.doctor:
+        from sqlite_guard_mcp.doctor import format_doctor_report, run_doctor
+
+        diag = run_doctor(db_path=args.db, policy_path=args.policy)
+        print(format_doctor_report(diag))
+        return 0 if diag["status"] != "ERROR" else 1
+
+    if args.validate_policy:
+        if not args.policy:
+            parser.error("--validate-policy requires --policy <file>.")
+        try:
+            load_policy(args.policy)
+            print(f"Policy configuration '{args.policy}' is valid.")
+            return 0
+        except ValueError as exc:
+            print(f"Policy configuration error: {exc}", file=sys.stderr)
+            return 1
+
+    if args.explain_policy_table:
+        try:
+            pol = load_policy(args.policy) if args.policy else default_policy()
+            explanation = pol.explain_access(args.explain_policy_table, args.explain_policy_column)
+            print(json.dumps(explanation, indent=2))
+            return 0
+        except ValueError as exc:
+            print(f"Policy error: {exc}", file=sys.stderr)
+            return 1
 
     if not args.db:
         parser.error("Provide --db or set the SQLITE_GUARD_DB environment variable.")

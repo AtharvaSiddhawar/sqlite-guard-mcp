@@ -1,0 +1,92 @@
+{
+  "version": "0.2.3",
+  "sqlite_version": "3.53.1",
+  "iterations": 50,
+  "metrics": {
+    "raw_sqlite_query": {
+      "mean": 2.792,
+      "p50": 1.246,
+      "p95": 9.676,
+      "p99": 23.97
+    },
+    "guarded_read_query": {
+      "mean": 35.081,
+      "p50": 26.592,
+      "p95": 82.105,
+      "p99": 106.69
+    },
+    "overhead_delta_p50_ms": 25.346,
+    "get_database_overview": {
+      "mean": 15.041,
+      "p50": 9.236,
+      "p95": 42.041,
+      "p99": 58.189
+    },
+    "schema_summary_resource": {
+      "mean": 133.588,
+      "p50": 108.245,
+      "p95": 256.515,
+      "p99": 295.148
+    },
+    "search_database_schema": {
+      "mean": 25.144,
+      "p50": 20.52,
+      "p95": 38.477,
+      "p99": 106.743
+    },
+    "explain_read_query": {
+      "mean": 20.481,
+      "p50": 10.961,
+      "p95": 81.18,
+      "p99": 168.236
+    },
+    "check_database_health": {
+      "mean": 371.372,
+      "p50": 365.175,
+      "p95": 396.755,
+      "p99": 400.375
+    },
+    "simulate_candidate_index": {
+      "mean": 21.181,
+      "p50": 19.826,
+      "p95": 25.271,
+      "p99": 26.035
+    },
+    "profile_database_table": {
+      "mean": 17.697,
+      "p50": 16.795,
+      "p95": 21.319,
+      "p99": 22.231
+    },
+    "snapshot_schema": {
+      "mean": 68.349,
+      "p50": 66.86,
+      "p95": 75.154,
+      "p99": 76.177
+    },
+    "diff_schemas": {
+      "mean": 13.514,
+      "p50": 13.259,
+      "p95": 16.823,
+      "p99": 17.894
+    },
+    "review_migration": {
+      "mean": 0.198,
+      "p50": 0.143,
+      "p95": 0.275,
+      "p99": 1.293
+    }
+  },
+  "describe_database_table": {
+    "mean": 13.776,
+    "p50": 11.67,
+    "p95": 25.383,
+    "p99": 27.824
+  },
+  "memory": {
+    "current_kb": 660.94,
+    "peak_kb": 806.65,
+    "peak_mb": 0.79
+  },
+  "total_elapsed_seconds": 11.7
+}

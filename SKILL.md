@@ -17,9 +17,14 @@ Use the SQLite Guard MCP server only when it is connected and the user has autho
 - `get_database_overview`: Retrieve database-level metrics including schema version, page count, page size, approximate file size, and table/view/index counts.
 - `search_database_schema`: Search table names, view names, column names, and index names case-insensitively with match limits.
 - `check_database_health`: Run database diagnostics including integrity checks (`quick_check`), foreign key checks (`foreign_key_check`), and index redundancy diagnostics.
+- `simulate_candidate_index`: Index Laboratory — test candidate indexes on a disposable in-memory clone, measuring plan improvements and speedup without touching source database.
+- `profile_database_table`: Privacy-preserving data profiling — compute null percentages, cardinality ratios, safe min/max, and distinct counts while masking sensitive columns.
+- `diff_database_schemas`: Compare current schema against another SQLite database file to detect schema drift, dropped columns, and breaking changes.
+- `review_migration_script`: Statically inspect a migration script for risks, dropped tables, lock risks, and missing transaction boundaries.
 
 ### Resources
 - `schema://summary`: Read a complete overview of all user tables, views, and column definitions in a single call.
+- `schema://snapshot`: Read a complete canonical JSON snapshot of all tables, columns, indexes, and foreign keys.
 
 ## Operating rules
 
