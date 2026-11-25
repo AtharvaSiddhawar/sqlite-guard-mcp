@@ -3,7 +3,7 @@
 A read-only, security-hardened SQLite MCP server for AI agents.
 """
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 from .index_lab import (
     simulate_index,

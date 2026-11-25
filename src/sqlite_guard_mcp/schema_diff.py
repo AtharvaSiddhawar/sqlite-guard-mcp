@@ -35,6 +35,10 @@ _DANGEROUS_PRAGMA_PATTERN = re.compile(
     r"\bPRAGMA\s+(?:writable_schema|cell_size_check|journal_mode\s*=\s*off)\b",
     re.IGNORECASE,
 )
+_DISABLE_FK_PRAGMA_PATTERN = re.compile(
+    r"\bPRAGMA\s+foreign_keys\s*=\s*(?:OFF|0|false|no)\b",
+    re.IGNORECASE,
+)
 _ATTACH_PATTERN = re.compile(r"\bATTACH\s+(?:DATABASE\s+)?", re.IGNORECASE)
 _BEGIN_PATTERN = re.compile(r"\bBEGIN\b", re.IGNORECASE)
 _COMMIT_PATTERN = re.compile(r"\bCOMMIT\b", re.IGNORECASE)
@@ -367,6 +371,26 @@ def review_migration(migration_sql: str) -> dict[str, Any]:
                 "message": f"Dangerous PRAGMA detected: '{dp}'.",
                 "recommendation": (
                     "Never mutate system pragmas or disable integrity checks in migrations."
+                ),
+            }
+        )
+
+    # Check for disabling foreign_keys enforcement (warning for table-rebuild migrations)
+    disabled_fks = _DISABLE_FK_PRAGMA_PATTERN.findall(cleaned)
+    for dfk in disabled_fks:
+        detected_operations.append(dfk)
+        issues.append(
+            {
+                "severity": "MEDIUM",
+                "category": "integrity_check_disabled",
+                "message": (
+                    f"Foreign key enforcement disabled via '{dfk}'. "
+                    "Referential integrity violations can occur while disabled."
+                ),
+                "recommendation": (
+                    "If performing a table-rebuild migration, verify integrity with "
+                    "'PRAGMA foreign_key_check;' and re-enable 'PRAGMA foreign_keys = ON;' "
+                    "before finishing."
                 ),
             }
         )

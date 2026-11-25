@@ -591,3 +591,342 @@ def test_comprehensive_branch_coverage(tmp_path: Path) -> None:
     doc_err = run_doctor(tmp_path / "missing.db", policy_path=tmp_path / "missing.toml")
     rep = format_doctor_report(doc_err)
     assert "[Errors]" in rep
+
+
+def _create_index_lab_regression_db(db_path: Path) -> None:
+    """Create a realistic isolated database for genuine query-plan regression tests."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE order_items (
+                order_item_id INTEGER PRIMARY KEY,
+                order_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_price REAL NOT NULL,
+                notes TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE orders_existing (
+                order_id INTEGER PRIMARY KEY,
+                customer_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                region TEXT NOT NULL,
+                notes TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX idx_existing_customer ON orders_existing(customer_id);")
+
+        conn.execute(
+            """
+            CREATE TABLE small_t (
+                id INTEGER PRIMARY KEY,
+                k INTEGER NOT NULL,
+                tag TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute("CREATE INDEX idx_small_k ON small_t(k);")
+        conn.execute(
+            """
+            CREATE TABLE large_t (
+                id INTEGER PRIMARY KEY,
+                k INTEGER NOT NULL,
+                tag TEXT NOT NULL
+            );
+            """
+        )
+
+        conn.executemany(
+            "INSERT INTO order_items VALUES (?, ?, ?, ?, ?, ?);",
+            [
+                (i, (i % 50) + 1, (i % 25) + 1, (i % 5) + 1, 9.99, f"note_{i}")
+                for i in range(1, 201)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO orders_existing VALUES (?, ?, ?, ?, ?);",
+            [
+                (i, (i % 40) + 1, "paid" if i % 2 == 0 else "pending", f"r_{i % 10}", f"n_{i}")
+                for i in range(1, 201)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO small_t VALUES (?, ?, ?);",
+            [(i, i, "keep") for i in range(1, 6)],
+        )
+        conn.executemany(
+            "INSERT INTO large_t VALUES (?, ?, ?);",
+            [(i, (i % 5) + 1, "keep") for i in range(1, 501)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_index_lab_regression_scan_elimination(tmp_path: Path) -> None:
+    """Test A: Verified reproduction — scan eliminated and candidate index selected."""
+    db_file = tmp_path / "reg_scan_elim.db"
+    _create_index_lab_regression_db(db_file)
+
+    query = (
+        "SELECT order_item_id, order_id, product_id, quantity FROM order_items WHERE product_id = ?"
+    )
+    candidate = "CREATE INDEX idx_order_items_product_id ON order_items(product_id)"
+    res = simulate_index(db_file, query, candidate, params=[1])
+
+    assert res["success"] is True
+    assert res["baseline"]["analysis"]["scans_table"] is True
+    assert "order_items" in res["baseline"]["analysis"]["scanned_tables"]
+    assert res["baseline"]["analysis"]["uses_index"] is False
+
+    cand_plan_details = " ".join(r["detail"] for r in res["candidate"]["plan"]).upper()
+    assert "SEARCH" in cand_plan_details
+    assert "IDX_ORDER_ITEMS_PRODUCT_ID" in cand_plan_details
+    assert res["candidate"]["analysis"]["scans_table"] is False
+    assert res["candidate"]["analysis"]["uses_index"] is True
+    assert "idx_order_items_product_id" in res["candidate"]["analysis"]["indexes_used"]
+
+    comp = res["comparison"]
+    assert comp["scan_eliminated"] is True
+    assert comp["plan_improved"] is True
+    assert comp["scan_regression"] is False
+    assert comp["eliminated_scans"] == ["order_items"]
+    assert comp["introduced_scans"] == []
+    assert comp["candidate_indexes_selected"] == ["idx_order_items_product_id"]
+    assert comp["candidate_indexes_not_selected"] == []
+    assert comp["outcome"] == "scan_eliminated"
+
+    rec_text = " ".join(res["recommendations"])
+    assert "idx_order_items_product_id" in rec_text
+    assert "order_items" in rec_text
+    assert "did not utilize" not in rec_text.lower()
+    assert "did not select" not in rec_text.lower()
+
+
+def test_index_lab_regression_candidate_not_utilized(tmp_path: Path) -> None:
+    """Test B: Irrelevant candidate index is not utilized and not falsely reported."""
+    db_file = tmp_path / "reg_unused.db"
+    _create_index_lab_regression_db(db_file)
+
+    query = "SELECT order_item_id, product_id FROM order_items WHERE product_id = ?"
+    candidate = "CREATE INDEX idx_order_items_notes ON order_items(notes)"
+    res = simulate_index(db_file, query, candidate, params=[1])
+
+    assert res["success"] is True
+    comp = res["comparison"]
+    assert comp["scan_eliminated"] is False
+    assert comp["plan_improved"] is False
+    assert comp["plan_changed"] is False
+    assert comp["candidate_indexes_selected"] == []
+    assert comp["candidate_indexes_not_selected"] == ["idx_order_items_notes"]
+    assert comp["outcome"] == "query_plan_unchanged"
+
+    rec_text = " ".join(res["recommendations"]).lower()
+    assert "idx_order_items_notes" in rec_text
+    assert "did not select" in rec_text
+
+
+def test_index_lab_regression_existing_index_used(tmp_path: Path) -> None:
+    """Test C: Existing index continues to be used instead of unrelated candidate index."""
+    db_file = tmp_path / "reg_existing.db"
+    _create_index_lab_regression_db(db_file)
+
+    query = "SELECT order_id, customer_id FROM orders_existing WHERE customer_id = ?"
+    candidate = "CREATE INDEX idx_orders_status ON orders_existing(status)"
+    res = simulate_index(db_file, query, candidate, params=[5])
+
+    assert res["success"] is True
+    comp = res["comparison"]
+    assert comp["scan_eliminated"] is False
+    assert comp["plan_improved"] is False
+    assert comp["plan_changed"] is False
+    assert comp["candidate_indexes_selected"] == []
+    assert comp["candidate_indexes_not_selected"] == ["idx_orders_status"]
+    assert comp["existing_indexes_used"] == ["idx_existing_customer"]
+    assert comp["outcome"] == "existing_index_used"
+
+    rec_text = " ".join(res["recommendations"])
+    assert "idx_existing_customer" in rec_text
+    assert "idx_orders_status" in rec_text
+
+
+def test_index_lab_regression_multiple_candidate_indexes(tmp_path: Path) -> None:
+    """Test D: Multiple candidate indexes separate selected from unused indexes."""
+    db_file = tmp_path / "reg_multi.db"
+    _create_index_lab_regression_db(db_file)
+
+    query = "SELECT order_id, region FROM orders_existing WHERE region = ?"
+    candidates = [
+        "CREATE INDEX idx_orders_region ON orders_existing(region)",
+        "CREATE INDEX idx_orders_notes ON orders_existing(notes)",
+    ]
+    res = simulate_index(db_file, query, candidates, params=["r_1"])
+
+    assert res["success"] is True
+    comp = res["comparison"]
+    assert comp["scan_eliminated"] is True
+    assert comp["plan_improved"] is True
+    assert comp["candidate_indexes_selected"] == ["idx_orders_region"]
+    assert comp["candidate_indexes_not_selected"] == ["idx_orders_notes"]
+
+    rec_text = " ".join(res["recommendations"])
+    assert "idx_orders_region" in rec_text
+    assert "idx_orders_notes" in rec_text
+
+
+def test_index_lab_regression_no_scan_regression(tmp_path: Path) -> None:
+    """Test E: Eliminating a scan on one table does not conceal a new scan elsewhere."""
+    db_file = tmp_path / "reg_join_flip.db"
+    _create_index_lab_regression_db(db_file)
+
+    query = (
+        "SELECT small_t.id, large_t.id FROM small_t "
+        "JOIN large_t ON small_t.k = large_t.k "
+        "WHERE small_t.tag = 'keep' AND large_t.tag = 'keep'"
+    )
+    candidate = "CREATE INDEX idx_large_k ON large_t(k)"
+    res = simulate_index(db_file, query, candidate)
+
+    assert res["success"] is True
+    assert res["baseline"]["analysis"]["scanned_tables"] == ["large_t"]
+    assert res["candidate"]["analysis"]["scanned_tables"] == ["small_t"]
+
+    comp = res["comparison"]
+    assert comp["eliminated_scans"] == ["large_t"]
+    assert comp["introduced_scans"] == ["small_t"]
+    assert comp["scan_regression"] is True
+    assert comp["scan_eliminated"] is False
+    assert comp["plan_improved"] is False
+    assert comp["outcome"] == "scan_regression_detected"
+
+    rec_text = " ".join(res["recommendations"])
+    assert "small_t" in rec_text
+    assert "large_t" in rec_text
+
+
+def test_index_lab_regression_temp_btree_and_covering_improvement(tmp_path: Path) -> None:
+    """Candidate index eliminating temp B-tree and gaining covering index is detected."""
+    db_file = tmp_path / "reg_temp_btree.db"
+    _create_index_lab_regression_db(db_file)
+
+    # Baseline uses idx_existing_customer + temp B-tree for ORDER BY status
+    query = "SELECT status FROM orders_existing WHERE customer_id = ? ORDER BY status"
+    candidate = "CREATE INDEX idx_orders_cust_status ON orders_existing(customer_id, status)"
+    res = simulate_index(db_file, query, candidate, params=[1])
+
+    assert res["success"] is True
+    assert res["baseline"]["analysis"]["uses_temp_btree"] is True
+    assert res["candidate"]["analysis"]["uses_temp_btree"] is False
+
+    comp = res["comparison"]
+    assert comp["temp_btree_eliminated"] is True
+    assert comp["covering_index_gained"] is True
+    assert comp["plan_improved"] is True
+    assert comp["candidate_indexes_selected"] == ["idx_orders_cust_status"]
+    assert comp["outcome"] == "candidate_index_selected"
+    rec_text = " ".join(res["recommendations"])
+    assert "idx_orders_cust_status" in rec_text
+    assert "temporary b-tree" in rec_text.lower()
+
+
+def test_index_lab_regression_plan_changed_without_improvement(tmp_path: Path) -> None:
+    """Distinguish query plan change without structural improvement (e.g., duplicate index)."""
+    db_file = tmp_path / "reg_plan_changed.db"
+    _create_index_lab_regression_db(db_file)
+
+    query = "SELECT order_id FROM orders_existing WHERE customer_id = ?"
+    # Exact duplicate of idx_existing_customer; SQLite switches to the newer duplicate index
+    candidate = "CREATE INDEX idx_dup_customer ON orders_existing(customer_id)"
+    res = simulate_index(db_file, query, candidate, params=[1])
+
+    assert res["success"] is True
+    comp = res["comparison"]
+    assert comp["scan_eliminated"] is False
+    assert comp["scan_regression"] is False
+    if comp["plan_changed"]:
+        assert comp["plan_improved"] is False
+        assert comp["outcome"] == "plan_changed_without_improvement"
+
+
+def test_index_lab_regression_source_db_isolation(tmp_path: Path) -> None:
+    """Test F: Source database schema, index count, and contents remain untouched."""
+    db_file = tmp_path / "reg_isolation.db"
+    _create_index_lab_regression_db(db_file)
+
+    def _inspect_source() -> tuple[int, list[tuple[str, str, str]], list[str]]:
+        conn = sqlite3.connect(db_file)
+        try:
+            schema_ver = conn.execute("PRAGMA schema_version;").fetchone()[0]
+            master_rows = conn.execute(
+                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name;"
+            ).fetchall()
+            idx_rows = [r[0] for r in conn.execute("PRAGMA index_list('order_items');").fetchall()]
+            return schema_ver, master_rows, idx_rows
+        finally:
+            conn.close()
+
+    before_ver, before_master, before_indexes = _inspect_source()
+
+    res = simulate_index(
+        db_file,
+        "SELECT order_item_id FROM order_items WHERE product_id = ?",
+        "CREATE INDEX idx_order_items_product_id ON order_items(product_id)",
+        params=[1],
+    )
+    assert res["success"] is True
+    assert res["source_database_unmodified"] is True
+
+    after_ver, after_master, after_indexes = _inspect_source()
+    assert after_ver == before_ver
+    assert after_master == before_master
+    assert after_indexes == before_indexes
+    assert "idx_order_items_product_id" not in after_indexes
+
+
+def test_review_migration_pragma_foreign_keys_off() -> None:
+    """PRAGMA foreign_keys = OFF emits a MEDIUM warning without blocking rebuilds."""
+    rebuild_sql = """
+    PRAGMA foreign_keys = OFF;
+    BEGIN TRANSACTION;
+    CREATE TABLE items_new (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    DROP TABLE items_old;
+    ALTER TABLE items_new RENAME TO items_old;
+    PRAGMA foreign_key_check;
+    COMMIT;
+    PRAGMA foreign_keys = ON;
+    """
+    res = review_migration(rebuild_sql)
+    assert res["success"] is True
+    fk_issues = [i for i in res["issues"] if i["category"] == "integrity_check_disabled"]
+    assert len(fk_issues) == 1
+    assert fk_issues[0]["severity"] == "MEDIUM"
+
+    # Standalone PRAGMA foreign_keys = OFF with transaction yields WARNING (not SAFE)
+    fk_only_sql = """
+    PRAGMA foreign_keys = OFF;
+    BEGIN TRANSACTION;
+    CREATE TABLE audit_log (id INTEGER PRIMARY KEY);
+    COMMIT;
+    """
+    res_warn = review_migration(fk_only_sql)
+    assert res_warn["success"] is True
+    assert res_warn["risk_level"] == "WARNING"
+    assert res_warn["safe"] is True
+    assert any(i["category"] == "integrity_check_disabled" for i in res_warn["issues"])
+
+    # PRAGMA foreign_keys = ON alone does not trigger warning
+    fk_on_sql = """
+    PRAGMA foreign_keys = ON;
+    BEGIN TRANSACTION;
+    CREATE TABLE audit_log (id INTEGER PRIMARY KEY);
+    COMMIT;
+    """
+    res_on = review_migration(fk_on_sql)
+    assert res_on["risk_level"] == "SAFE"
+    assert res_on["issues"] == []

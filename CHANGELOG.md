@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-11-25
+
+### Fixed
+- **Index Laboratory Comparison Logic (`simulate_candidate_index`)**: Replaced stale `scans` / `searches` lookup keys in `simulate_index()` with `_synthesize_plan_comparison()`, reading the actual `_analyze_query_plan()` fields (`scanned_tables`, `scans_table`, `indexes_used`, `uses_index`, `uses_temp_btree`, `observations`) and comparing against validated candidate index names.
+- **Candidate-Index Selection & Scan-Elimination Reporting**: Fixed false-negative comparison results where candidate indexes selected by SQLite for `SEARCH` operations previously reported `plan_improved: false`, `scan_eliminated: false`, and inaccurate non-utilization recommendations.
+- **Index Recommendation Accuracy**: Improved recommendation generation to distinguish full-table-scan elimination, candidate index selection, unused candidate indexes, existing index reuse, unchanged plans, and plan changes without structural improvement, without equating index usage with guaranteed latency speedup.
+
+### Added
+- **Scan-Regression Detection**: Added `scan_regression`, `introduced_scans`, `eliminated_scans`, `remaining_scans`, and `outcome` comparison fields so an improvement on one table does not conceal a newly introduced full table scan elsewhere in the query plan.
+- **Index Laboratory Regression Tests**: Added regression test coverage for scan elimination, unused candidate indexes, existing index retention, multiple candidate indexes, introduced scan regressions, temporary B-tree elimination, covering index improvements, plan changes without improvement, and source database isolation.
+- **Migration Review Warning for Foreign-Key Disabling**: Added a `MEDIUM` warning (`category: "integrity_check_disabled"`) in `review_migration()` / `review_migration_script` when `PRAGMA foreign_keys = OFF` (`OFF|0|false|no`) is detected, recommending `PRAGMA foreign_key_check;` and re-enabling `PRAGMA foreign_keys = ON;`.
+
+### Security
+- **Preserved Original Database Isolation**: Verified `simulate_index()` continues to open the source database in `?mode=ro` URI mode and clones into `:memory:` via SQLite's online backup API without modifying the source database.
+
 ## [0.2.3] - 2026-11-24
 
 ### Added
